@@ -1,0 +1,21 @@
+# Modified for Dify Workbench 1.11.1 on 2026-09-30; see NOTICE and MODIFICATIONS.md.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm run smoke:mcp:upstream
+      - run: npm run smoke:mcp:http:upstream

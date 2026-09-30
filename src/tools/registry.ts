@@ -1,0 +1,2403 @@
+// Single source of truth: every operation is a Tool with a pure async run fn.
+// CLI and MCP are thin adapters over this registry. Confirm-gated tools never
+// prompt; they require confirm=true (CLI --yes) per call.
+
+import fs from "node:fs";
+import path from "node:path";
+import { err, ok, type Err, type Result } from "../core/contract.ts";
+import { maskToken, resolveConfig, storeWorkspace, type Config, type Flags } from "../core/config.ts";
+import { OpenapiClient } from "../api/openapi.ts";
+import { ConsoleClient } from "../api/console.ts";
+import { graphHasCodeNodes, validateGraph, type Graph, type GraphEdge } from "../graph/validate.ts";
+import { guideText } from "./guide.ts";
+import { consoleLogin, parseAuthCookiesFromInput, refreshConsoleCookies, storeCookies, storeToken } from "../core/auth.ts";
+import { isPrivateUrl } from "../core/private-url.ts";
+import { redactArgs } from "../core/redact.ts";
+import { difywfHome } from "../core/paths.ts";
+
+/** Optional MCP progress reporter (CLI leaves this undefined). */
+export type ProgressReporter = (update: {
+  progress: number;
+  total?: number;
+  message?: string;
+}) => void | Promise<void>;
+
+export type ToolCtx = {
+  cfg: Config;
+  openapi: OpenapiClient | null;
+  console: ConsoleClient | null;
+  onProgress?: ProgressReporter;
+};
+export type Tool = {
+  name: string;
+  summary: string;
+  schema: Record<string, unknown>;
+  needs?: "openapi" | "console";
+  confirm?: boolean;
+  run: (args: Record<string, unknown>, ctx: ToolCtx) => Promise<Result<unknown>>;
+};
+
+export class ToolError extends Error {
+  code: Err["code"];
+  retryable: boolean;
+  details?: unknown;
+  constructor(code: Err["code"], message: string, retryable = false, details?: unknown) {
+    super(message);
+    this.code = code;
+    this.retryable = retryable;
+    this.details = details;
+  }
+}
+
+export function makeCtx(flags: Flags): ToolCtx {
+  const cfg = resolveConfig(flags);
+  const onProgress =
+    typeof flags._onProgress === "function" ? (flags._onProgress as ProgressReporter) : undefined;
+  const onEvent = onProgress
+    ? async (event: unknown, index: number): Promise<void> => {
+        const message =
+          event && typeof event === "object" && "event" in event
+            ? String((event as Record<string, unknown>).event)
+            : `event_${index + 1}`;
+        await onProgress({ progress: index + 1, message });
+      }
+    : undefined;
+  const refreshCb = cfg.consoleCookies
+    ? async (cookies: Record<string, string>): Promise<Record<string, string> | null> => {
+        const r = await refreshConsoleCookies(cfg.baseUrl, cookies);
+        if (r.ok) {
+          storeCookies(cfg.baseUrl, r.data);
+          return r.data;
+        }
+        return null;
+      }
+    : undefined;
+  return {
+    cfg,
+    openapi: cfg.baseUrl && cfg.openapiToken ? new OpenapiClient(cfg.baseUrl, cfg.openapiToken) : null,
+    console:
+      cfg.baseUrl && (cfg.consoleToken || cfg.consoleCookies)
+        ? new ConsoleClient(cfg.baseUrl, cfg.consoleToken, cfg.consoleCookies, refreshCb, onEvent)
+        : null,
+    onProgress,
+  };
+}
+
+function needClient(ctx: ToolCtx, kind: "openapi" | "console"): OpenapiClient | ConsoleClient {
+  const client = kind === "openapi" ? ctx.openapi : ctx.console;
+  if (!ctx.cfg.baseUrl) {
+    throw new ToolError("USAGE_ERROR", "no base URL; pass --base-url, set DIFY_API_BASE, or run `difywf auth login`");
+  }
+  if (!client) {
+    throw new ToolError(
+      "AUTH_REQUIRED",
+      kind === "openapi"
+        ? "no OpenAPI token; set DIFY_OPENAPI_TOKEN or run `difywf auth login`"
+        : "no console session; import cookies (`difywf auth import-cookies` / auth.import_cookies), set DIFY_CONSOLE_COOKIE, or run `difywf auth login-console`",
+    );
+  }
+  return client;
+}
+
+function consoleFirst<T>(
+  ctx: ToolCtx,
+  consoleFn: (c: ConsoleClient) => Promise<Result<T>>,
+  openapiFn: (o: OpenapiClient) => Promise<Result<T>>,
+  missing = "this tool needs console cookies or an OpenAPI token",
+): Promise<Result<T>> {
+  if (ctx.console) return consoleFn(ctx.console);
+  if (ctx.openapi) return openapiFn(ctx.openapi);
+  throw new ToolError("AUTH_REQUIRED", missing);
+}
+
+function codeNodePolicy(): "allow" | "confirm" | "forbid" {
+  const v = (process.env.DIFYWF_CODE_NODES ?? "confirm").toLowerCase();
+  if (v === "allow" || v === "forbid") return v;
+  return "confirm";
+}
+
+function assertGraphPolicies(graph: Graph, args: Record<string, unknown>, dryRun: boolean): Result<unknown> | null {
+  if (dryRun) return null;
+  if (!graphHasCodeNodes(graph)) return null;
+  const policy = codeNodePolicy();
+  if (policy === "forbid") {
+    return err("VALIDATION_FAILED", "graph contains code nodes; DIFYWF_CODE_NODES=forbid");
+  }
+  if (policy === "confirm" && args.confirm !== true) {
+    return err(
+      "CONFIRM_REQUIRED",
+      "graph contains code nodes that execute server-side; pass confirm=true (or set DIFYWF_CODE_NODES=allow)",
+    );
+  }
+  return null;
+}
+
+function draftFields(data: unknown): {
+  graph?: Graph;
+  features?: unknown;
+  environment_variables?: unknown;
+  conversation_variables?: unknown;
+  hash?: string;
+} {
+  const d = data && typeof data === "object" ? (data as Record<string, unknown>) : {};
+  return {
+    graph: d.graph && typeof d.graph === "object" ? (d.graph as Graph) : undefined,
+    features: d.features,
+    environment_variables: d.environment_variables,
+    conversation_variables: d.conversation_variables,
+    hash: typeof d.hash === "string" ? d.hash : undefined,
+  };
+}
+
+function assertPublicYamlUrl(url: string | undefined): void {
+  if (!url || !isPrivateUrl(url)) return;
+  if (process.env.DIFYWF_ALLOW_PRIVATE_URL === "1") return;
+  throw new ToolError(
+    "VALIDATION_FAILED",
+    "yaml_url targets a private/loopback host; set DIFYWF_ALLOW_PRIVATE_URL=1 to allow",
+  );
+}
+
+// Prefer the console (cookie-auth) surface; fall back to OpenAPI. Used by tools
+// both surfaces support (apps list/get/export, workspaces) so a user with only
+// console cookies isn't blocked by a missing OpenAPI management token.
+function clientAny(ctx: ToolCtx): OpenapiClient | ConsoleClient {
+  const c = ctx.console ?? ctx.openapi;
+  if (!c) {
+    throw new ToolError("AUTH_REQUIRED", "no console or openapi credential; run `difywf auth login[-console]` or `difywf auth login`");
+  }
+  return c;
+}
+
+type AppRow = { id: string; name: string; mode?: string };
+
+const DSL_VERSION = "0.7.0";
+
+function assertDslVersion(yaml: string): void {
+  const match = /^version:[ \t]*(?:"([^"]+)"|'([^']+)'|([^\s#\r\n]+))[ \t]*(?:#.*)?$/m.exec(yaml);
+  const version = match?.[1] ?? match?.[2] ?? match?.[3];
+  if (version !== DSL_VERSION) {
+    throw new ToolError(
+      "DSL_VERSION_MISMATCH",
+      version
+        ? `DSL version ${version} is unsupported; expected ${DSL_VERSION}`
+        : `DSL version is missing; expected ${DSL_VERSION}`,
+    );
+  }
+}
+
+function resultRows(data: unknown): Record<string, unknown>[] {
+  const rows = Array.isArray(data)
+    ? data
+    : data && typeof data === "object"
+      ? (data as Record<string, unknown>).data ?? (data as Record<string, unknown>).items
+      : undefined;
+  if (!Array.isArray(rows)) return [];
+  return rows.filter((row): row is Record<string, unknown> => !!row && typeof row === "object");
+}
+
+function appRow(row: Record<string, unknown>): AppRow | undefined {
+  const id = str(row.id);
+  const name = str(row.name);
+  if (!id || !name) return undefined;
+  return { id, name, mode: str(row.mode) };
+}
+
+async function listAllApps(ctx: ToolCtx): Promise<Result<AppRow[]>> {
+  const client = clientAny(ctx);
+  const rows: AppRow[] = [];
+  for (let page = 1; ; page++) {
+    const result = await client.listApps({ page, limit: 100 });
+    if (!result.ok) return result;
+    const pageRows = resultRows(result.data).flatMap((row) => {
+      const app = appRow(row);
+      return app ? [app] : [];
+    });
+    rows.push(...pageRows);
+    const payload = result.data && typeof result.data === "object" ? result.data as Record<string, unknown> : {};
+    const hasMore = payload.has_more === true || payload.hasMore === true;
+    if (!hasMore) break;
+  }
+  return ok(rows);
+}
+
+function backupFilename(app: AppRow): string {
+  const safe = (value: string) => value.replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+  return `${safe(app.name).slice(0, 80) || "app"}-${safe(app.id) || "app"}.yml`;
+}
+
+const S = (desc: string) => ({ type: "string", description: desc });
+const O = (desc: string) => ({ type: "object", description: desc });
+const B = (desc: string) => ({ type: "boolean", description: desc });
+const CONFIRM = B("required for destructive ops; pass true (CLI --yes) to proceed");
+
+export const tools: Tool[] = [
+  {
+    name: "agent.guide",
+    summary: "Self-onboarding playbook for agents: golden path, node types, error codes, safety rules.",
+    schema: { type: "object", properties: { section: S("overview|quickstart|compatibility|nodes|errors|safety|all") } },
+    run: async (args) => ok(guideText(typeof args.section === "string" ? args.section : undefined)),
+  },
+  {
+    name: "auth.status",
+    summary: "Show resolved base URL, workspace, and which tokens are configured (masked).",
+    schema: { type: "object", properties: {} },
+    run: async (_args, ctx) =>
+      ok({
+        base_url: ctx.cfg.baseUrl || null,
+        workspace: ctx.cfg.workspaceId ?? null,
+        openapi_token: maskToken(ctx.cfg.openapiToken),
+        console_token: maskToken(ctx.cfg.consoleToken),
+        console_cookies: ctx.cfg.consoleCookies ? Object.keys(ctx.cfg.consoleCookies) : null,
+      }),
+  },
+  {
+    name: "auth.import_cookies",
+    summary: "Store console session cookies (cookie-editor JSON or Cookie header). MCP equivalent of `difywf auth import-cookies`.",
+    schema: {
+      type: "object",
+      properties: { cookies: { description: "cookie-editor JSON, {cookies:[]}, Cookie header, or name/value object" }, base_url: S("Dify base URL if not already configured") },
+      required: ["cookies"],
+    },
+    run: async (args, ctx) => {
+      const base = str(args.base_url) ?? ctx.cfg.baseUrl;
+      if (!base) throw new ToolError("USAGE_ERROR", "no base URL; pass base_url or set DIFY_API_BASE");
+      const cookies = parseAuthCookiesFromInput(args.cookies);
+      if (!Object.keys(cookies).length) {
+        throw new ToolError("USAGE_ERROR", "no auth cookies found; expected access_token/console_token, csrf_token, refresh_token");
+      }
+      storeCookies(base, cookies);
+      return ok({ stored: true, base_url: base, cookies: Object.keys(cookies) });
+    },
+  },
+  {
+    name: "auth.login_console",
+    summary: "Email/password console login; stores rotated session cookies.",
+    schema: {
+      type: "object",
+      properties: {
+        email: S("console email"),
+        password: S("console password"),
+        password_encoding: { type: "string", enum: ["plain", "base64"] },
+        base_url: S("Dify base URL if not already configured"),
+      },
+      required: ["email", "password"],
+    },
+    run: async (args, ctx) => {
+      const base = str(args.base_url) ?? ctx.cfg.baseUrl;
+      if (!base) throw new ToolError("USAGE_ERROR", "no base URL; pass base_url or set DIFY_API_BASE");
+      const encoding = str(args.password_encoding) === "base64" ? "base64" : "plain";
+      const result = await consoleLogin(base, req(args, "email"), req(args, "password"), encoding);
+      if (!result.ok) return result;
+      storeCookies(base, result.data);
+      return ok({ stored: true, base_url: base, cookies: Object.keys(result.data) });
+    },
+  },
+  {
+    name: "auth.set_tokens",
+    summary: "Store an OpenAPI and/or console bearer token for this base URL.",
+    schema: {
+      type: "object",
+      properties: {
+        openapi_token: S("OpenAPI device/management token"),
+        console_token: S("console bearer token (legacy)"),
+        base_url: S("Dify base URL if not already configured"),
+      },
+    },
+    run: async (args, ctx) => {
+      const base = str(args.base_url) ?? ctx.cfg.baseUrl;
+      if (!base) throw new ToolError("USAGE_ERROR", "no base URL; pass base_url or set DIFY_API_BASE");
+      if (str(args.openapi_token)) storeToken(base, "openapi_token", str(args.openapi_token)!);
+      if (str(args.console_token)) storeToken(base, "console_token", str(args.console_token)!);
+      if (!str(args.openapi_token) && !str(args.console_token)) {
+        throw new ToolError("USAGE_ERROR", "pass openapi_token and/or console_token");
+      }
+      return ok({ stored: true, base_url: base });
+    },
+  },
+  {
+    name: "app.list",
+    summary: "List apps in the workspace.",
+    needs: "openapi",
+    schema: { type: "object", properties: { page: { type: "number" }, limit: { type: "number" }, mode: S("filter by app mode"), name: S("search by name") } },
+    run: async (args, ctx) =>
+      (clientAny(ctx)).listApps({
+        page: num(args.page), limit: num(args.limit),
+        mode: str(args.mode), name: str(args.name),
+      }),
+  },
+  {
+    name: "app.get",
+    summary: "Describe one app.",
+    needs: "openapi",
+    schema: { type: "object", properties: { app_id: { ...S("app uuid"), ...{ } } }, required: ["app_id"] },
+    run: async (args, ctx) => (clientAny(ctx)).getApp(req(args, "app_id")),
+  },
+  {
+    name: "app.create",
+    summary: "Create an app. mode: chat | agent-chat | advanced-chat | workflow | completion.",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: {
+        mode: { type: "string", enum: ["chat", "agent-chat", "advanced-chat", "workflow", "completion"] },
+        name: S("app name"), description: S("max 400 chars"), icon: S("emoji"), icon_type: S("emoji|image"), icon_background: S("hex color"),
+      },
+      required: ["mode", "name"],
+    },
+    run: async (args, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).createApp(pick(args, ["mode", "name", "description", "icon", "icon_type", "icon_background"])),
+  },
+  {
+    name: "app.update",
+    summary: "Update app metadata (name, description, icon).",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), name: S(""), description: S(""), icon: S(""), icon_type: S(""), icon_background: S("") }, required: ["app_id"] },
+    run: async (args, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).updateApp(req(args, "app_id"), pick(args, ["name", "description", "icon", "icon_type", "icon_background"])),
+  },
+  {
+    name: "app.list_tags",
+    summary: "List the exact tags currently bound to one app.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (args, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).getAppTags(req(args, "app_id")),
+  },
+  {
+    name: "app.ensure_tag",
+    summary: "Create an app tag if needed, bind it to an app, and verify exact-name readback. Requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: {
+      type: "object",
+      properties: { app_id: S("app uuid"), tag: S("exact app tag name"), confirm: CONFIRM },
+      required: ["app_id", "tag", "confirm"],
+    },
+    run: async (args, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).ensureAppTag(req(args, "app_id"), req(args, "tag")),
+  },
+  {
+    name: "app.remove_tag",
+    summary: "Unbind one exact-name tag from an app and verify readback. Requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: {
+      type: "object",
+      properties: { app_id: S("app uuid"), tag: S("exact app tag name"), confirm: CONFIRM },
+      required: ["app_id", "tag", "confirm"],
+    },
+    run: async (args, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).removeAppTag(req(args, "app_id"), req(args, "tag")),
+  },
+  {
+    name: "app.delete",
+    summary: "Delete an app. Destructive; requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), confirm: CONFIRM }, required: ["app_id", "confirm"] },
+    run: async (args, ctx) => (needClient(ctx, "console") as ConsoleClient).deleteApp(req(args, "app_id")),
+  },
+  {
+    name: "app.export",
+    summary: "Export an app as DSL (YAML string). include_secret defaults to false and requires confirm=true.",
+    schema: {
+      type: "object",
+      properties: { app_id: S("app uuid"), include_secret: B("include env-var secrets in the DSL"), confirm: CONFIRM },
+      required: ["app_id"],
+    },
+    run: async (args, ctx) => {
+      const includeSecret = args.include_secret === true;
+      if (includeSecret && args.confirm !== true) {
+        return err("CONFIRM_REQUIRED", "include_secret=true exports credentials; pass confirm=true to proceed");
+      }
+      const result = await clientAny(ctx).exportDsl(req(args, "app_id"), includeSecret);
+      if (result.ok) assertDslVersion(result.data);
+      return result;
+    },
+  },
+  {
+    name: "app.backup",
+    summary: "Bulk-export app DSL files to a local backup directory. include_secret and overwrite require confirm=true.",
+    schema: {
+      type: "object",
+      properties: {
+        path: S("local backup directory"),
+        app_ids: { type: "array", items: { type: "string" }, description: "optional app id filter" },
+        mode: S("optional app mode filter"),
+        name: S("optional case-insensitive app name substring filter"),
+        limit: { type: "number", description: "maximum apps to back up" },
+        include_secret: B("include env-var secrets; requires confirm=true"),
+        overwrite: B("replace existing files; requires confirm=true"),
+        confirm: CONFIRM,
+      },
+      required: ["path"],
+    },
+    run: async (args, ctx) => {
+      const includeSecret = args.include_secret === true;
+      const overwrite = args.overwrite === true;
+      if ((includeSecret || overwrite) && args.confirm !== true) {
+        return err(
+          "CONFIRM_REQUIRED",
+          "include_secret=true and overwrite=true both require confirm=true (CLI: --yes)",
+        );
+      }
+      const dir = path.resolve(req(args, "path"));
+      if (fs.existsSync(dir) && !fs.statSync(dir).isDirectory()) {
+        return err("USAGE_ERROR", `backup path is not a directory: ${dir}`);
+      }
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+      const listed = await listAllApps(ctx);
+      if (!listed.ok) return listed;
+      let apps = listed.data;
+      const requestedIds = Array.isArray(args.app_ids)
+        ? args.app_ids.filter((id): id is string => typeof id === "string" && id.length > 0)
+        : [];
+      if (requestedIds.length) {
+        const requested = new Set(requestedIds);
+        apps = apps.filter((app) => requested.has(app.id));
+        const missing = requestedIds.filter((id) => !apps.some((app) => app.id === id));
+        if (missing.length) return err("NOT_FOUND", `app(s) not found: ${missing.join(", ")}`);
+      }
+      if (str(args.mode)) apps = apps.filter((app) => app.mode === str(args.mode));
+      if (str(args.name)) {
+        const needle = str(args.name)!.toLowerCase();
+        apps = apps.filter((app) => app.name.toLowerCase().includes(needle));
+      }
+      const limit = num(args.limit);
+      if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+        return err("USAGE_ERROR", "limit must be a positive integer");
+      }
+      if (limit !== undefined) apps = apps.slice(0, limit);
+
+      const files = apps.map((app) => ({ app, file: backupFilename(app) }));
+      if (!overwrite) {
+        const existing = files.filter(({ file }) => fs.existsSync(path.join(dir, file)));
+        if (fs.existsSync(path.join(dir, "manifest.json"))) existing.push({ app: { id: "manifest", name: "manifest" }, file: "manifest.json" });
+        if (existing.length) {
+          return err("USAGE_ERROR", `backup file(s) already exist; pass overwrite=true to replace: ${existing.map((x) => x.file).join(", ")}`);
+        }
+      }
+
+      const manifestFiles: Array<Record<string, unknown>> = [];
+      for (const { app, file } of files) {
+        const exported = await clientAny(ctx).exportDsl(app.id, includeSecret);
+        if (!exported.ok) return exported;
+        assertDslVersion(exported.data);
+        fs.writeFileSync(path.join(dir, file), exported.data, { mode: 0o600 });
+        try {
+          fs.chmodSync(path.join(dir, file), 0o600);
+        } catch {
+          // Windows and unusual filesystems may reject chmod; content is still written.
+        }
+        manifestFiles.push({ app_id: app.id, name: app.name, mode: app.mode ?? null, file });
+      }
+      const manifest = {
+        created_at: new Date().toISOString(),
+        base_url: ctx.cfg.baseUrl,
+        include_secret: includeSecret,
+        app_count: manifestFiles.length,
+        files: manifestFiles,
+      };
+      fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(manifest, null, 2), { mode: 0o600 });
+      try {
+        fs.chmodSync(path.join(dir, "manifest.json"), 0o600);
+      } catch {
+        // Some filesystems reject chmod; the caller still gets a complete backup.
+      }
+      return ok({ backup_path: dir, app_count: manifestFiles.length, files: manifestFiles });
+    },
+  },
+  {
+    name: "workflow.get_draft",
+    summary: "Get the draft workflow graph, features, variables, and current hash.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (args, ctx) => (needClient(ctx, "console") as ConsoleClient).getDraft(req(args, "app_id")),
+  },
+  {
+    name: "workflow.node_defaults",
+    summary: "Get the default config schema for one node type (or all). Call before authoring nodes.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), node_type: S("e.g. llm, code, if-else") }, required: ["app_id"] },
+    run: async (args, ctx) => (needClient(ctx, "console") as ConsoleClient).nodeDefaults(req(args, "app_id"), str(args.node_type)),
+  },
+  {
+    name: "workflow.validate",
+    summary: "Offline graph validation: structure, required fields, variable refs, connectivity, cycles.",
+    schema: {
+      type: "object",
+      properties: {
+        graph: O("the graph object {nodes, edges}"),
+        graph_json: S("graph as a JSON string"),
+        app_id: S("optional; fetch server node defaults for per-type schema checks"),
+      },
+    },
+    run: async (args, ctx) => {
+      const graph = parseGraphArg(args);
+      let defaults: Record<string, unknown> | undefined;
+      if (str(args.app_id) && ctx.console) {
+        const d = await ctx.console.nodeDefaults(str(args.app_id)!);
+        if (d.ok) defaults = defaultsToMap(d.data);
+      }
+      const issues = validateGraph(graph, { defaults });
+      const errors = issues.filter((i) => i.level === "error");
+      return ok({ valid: errors.length === 0, error_count: errors.length, warning_count: issues.length - errors.length, issues });
+    },
+  },
+  {
+    name: "workflow.sync_draft",
+    summary: "Validate and save the draft graph. Supports dry_run diff. Optimistic-concurrency via hash. Omitting env/conversation variables keeps the current draft values (does not wipe them).",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: {
+        app_id: S("app uuid"), graph: O("{nodes, edges}"), graph_json: S("graph as a JSON string"),
+        features: O("app features"),
+        environment_variables: { type: "array" }, conversation_variables: { type: "array" },
+        hash: S("current draft hash; fetched automatically when omitted"),
+        dry_run: B("validate + return diff without saving"),
+        confirm: CONFIRM,
+      },
+      required: ["app_id"],
+    },
+    run: async (args, ctx) => {
+      const client = needClient(ctx, "console") as ConsoleClient;
+      const graph = parseGraphArg(args);
+      const issues = validateGraph(graph);
+      const errors = issues.filter((i) => i.level === "error");
+      if (errors.length > 0) return err("VALIDATION_FAILED", `${errors.length} error-level issue(s)`, { details: issues });
+      const dryRun = args.dry_run === true;
+      const policy = assertGraphPolicies(graph, args, dryRun);
+      if (policy) return policy;
+      const current = await client.getDraft(req(args, "app_id"));
+      if (dryRun) return dryRunBaseline(current, graph, issues);
+      const fields = current.ok ? draftFields(current.data) : {};
+      // Cloud SyncDraftWorkflowPayload requires graph+features. Env/conversation
+      // variables are optional there and rejected as extra_forbidden when sent as
+      // [] on an uninitialized draft — only include them when the caller or the
+      // current draft actually has them.
+      const body: Record<string, unknown> = {
+        graph,
+        features: args.features ?? fields.features ?? {},
+      };
+      const envVars = args.environment_variables ?? fields.environment_variables;
+      const convVars = args.conversation_variables ?? fields.conversation_variables;
+      const hash = str(args.hash) ?? fields.hash;
+      if (envVars !== undefined) body.environment_variables = envVars;
+      if (convVars !== undefined) body.conversation_variables = convVars;
+      if (hash !== undefined) body.hash = hash;
+      return client.syncDraft(req(args, "app_id"), body);
+    },
+  },
+  {
+    name: "workflow.run_draft",
+    summary: "Run the draft workflow with inputs; returns the SSE event list.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), inputs: O("input variables") }, required: ["app_id", "inputs"] },
+    run: async (args, ctx) => (needClient(ctx, "console") as ConsoleClient).runDraft(req(args, "app_id"), obj(args, "inputs")),
+  },
+  {
+    name: "workflow.run",
+    summary: "Run the published app with inputs; returns the SSE event list. Console cookies first; OpenAPI token fallback.",
+    schema: { type: "object", properties: { app_id: S("app uuid"), inputs: O("input variables") }, required: ["app_id", "inputs"] },
+    run: async (args, ctx) =>
+      consoleFirst(
+        ctx,
+        (c) => c.runPublished(req(args, "app_id"), obj(args, "inputs")),
+        (o) => o.runApp(req(args, "app_id"), obj(args, "inputs")),
+      ),
+  },
+  {
+    name: "workflow.events",
+    summary: "Fetch the task event stream for a run. OpenAPI SSE when a token is present; cookie-only sessions fall back to the console run record.",
+    schema: { type: "object", properties: { app_id: S("app uuid"), task_id: S("task or run id") }, required: ["app_id", "task_id"] },
+    run: async (args, ctx) => {
+      if (ctx.openapi) return ctx.openapi.taskEvents(req(args, "app_id"), req(args, "task_id"));
+      if (ctx.console) return ctx.console.getRun(req(args, "app_id"), req(args, "task_id"));
+      throw new ToolError("AUTH_REQUIRED", "workflow.events needs an OpenAPI token or console cookies");
+    },
+  },
+  {
+    name: "workflow.run_node",
+    summary: "Run a single draft node for debugging.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), node_id: S("node id"), inputs: O("input variables"), mode: { type: "string", enum: ["node", "iteration", "loop"] } }, required: ["app_id", "node_id", "inputs"] },
+    run: async (args, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).runNode(req(args, "app_id"), req(args, "node_id"), obj(args, "inputs"), (str(args.mode) as "node" | "iteration" | "loop") ?? "node"),
+  },
+  {
+    name: "workflow.stop",
+    summary: "Stop a running task. Console cookies first; OpenAPI token fallback.",
+    schema: { type: "object", properties: { app_id: S("app uuid"), task_id: S("task id") }, required: ["app_id", "task_id"] },
+    run: async (args, ctx) =>
+      consoleFirst(
+        ctx,
+        (c) => c.stopTask(req(args, "app_id"), req(args, "task_id")),
+        (o) => o.stopTask(req(args, "app_id"), req(args, "task_id")),
+      ),
+  },
+  {
+    name: "workflow.node_last_run",
+    summary: "Get the last draft run result for one node (debugging).",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), node_id: S("node id") }, required: ["app_id", "node_id"] },
+    run: async (args, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).nodeLastRun(req(args, "app_id"), req(args, "node_id")),
+  },
+  {
+    name: "workflow.publish",
+    summary: "Publish the current draft. Destructive; requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), marked_name: S("version name, max 20 chars"), marked_comment: S("max 100 chars"), confirm: CONFIRM }, required: ["app_id", "confirm"] },
+    run: async (args, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).publish(req(args, "app_id"), pick(args, ["marked_name", "marked_comment"])),
+  },
+  {
+    name: "workflow.tool_get",
+    summary: "Get a workflow-as-tool provider by workflow app id or workflow tool id, including its synced status.",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: { app_id: S("workflow app uuid"), workflow_tool_id: S("workflow tool provider uuid") },
+      anyOf: [{ required: ["app_id"] }, { required: ["workflow_tool_id"] }],
+    },
+    run: async (args, ctx) => {
+      const appId = str(args.app_id);
+      const toolId = str(args.workflow_tool_id);
+      if (!appId && !toolId) throw new ToolError("USAGE_ERROR", "pass app_id or workflow_tool_id");
+      return (needClient(ctx, "console") as ConsoleClient).getWorkflowTool({ appId, toolId });
+    },
+  },
+  {
+    name: "workflow.tool_refresh_provider",
+    summary: "Create or update a workflow-as-tool provider so it targets the app's current published version; verifies synced=true.",
+    needs: "console",
+    confirm: true,
+    schema: {
+      type: "object",
+      properties: { app_id: S("published workflow app uuid"), confirm: CONFIRM },
+      required: ["app_id", "confirm"],
+    },
+    run: async (args, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).refreshWorkflowToolProvider(req(args, "app_id")),
+  },
+  {
+    name: "workflow.tool_delete",
+    summary: "Delete a workflow-as-tool provider. Destructive; requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: {
+      type: "object",
+      properties: { workflow_tool_id: S("workflow tool provider uuid"), confirm: CONFIRM },
+      required: ["workflow_tool_id", "confirm"],
+    },
+    run: async (args, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).deleteWorkflowTool(req(args, "workflow_tool_id")),
+  },
+  {
+    name: "provider.list",
+    summary: "List model providers configured in the workspace.",
+    needs: "console",
+    schema: { type: "object", properties: {} },
+    run: async (_args, ctx) => (needClient(ctx, "console") as ConsoleClient).listProviders(),
+  },
+  {
+    name: "provider.models",
+    summary: "List models for one provider.",
+    needs: "console",
+    schema: { type: "object", properties: { provider: S("e.g. openai") }, required: ["provider"] },
+    run: async (args, ctx) => (needClient(ctx, "console") as ConsoleClient).providerModels(req(args, "provider")),
+  },
+  {
+    name: "provider.set_credentials",
+    summary: "Set provider API credentials. Sensitive; requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { provider: S("e.g. openai"), credentials: O("provider credential fields"), confirm: CONFIRM }, required: ["provider", "credentials", "confirm"] },
+    run: async (args, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).setProviderCredentials(req(args, "provider"), obj(args, "credentials")),
+  },
+  {
+    name: "plugin.list",
+    summary: "List installed plugins in the workspace.",
+    needs: "console",
+    schema: { type: "object", properties: {} },
+    run: async (_args, ctx) => (needClient(ctx, "console") as ConsoleClient).listPlugins(),
+  },
+  {
+    name: "plugin.get",
+    summary: "Fetch a plugin manifest by unique identifier.",
+    needs: "console",
+    schema: { type: "object", properties: { plugin_unique_identifier: S("plugin unique identifier") }, required: ["plugin_unique_identifier"] },
+    run: async (args, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).getPlugin(req(args, "plugin_unique_identifier")),
+  },
+  {
+    name: "plugin.install",
+    summary: "Install plugins from the marketplace (or pkg). Requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: {
+      type: "object",
+      properties: {
+        identifiers: { type: "array", items: { type: "string" }, description: "plugin_unique_identifiers" },
+        source: { type: "string", enum: ["marketplace", "pkg"] },
+        confirm: CONFIRM,
+      },
+      required: ["identifiers", "confirm"],
+    },
+    run: async (args, ctx) => {
+      const ids = Array.isArray(args.identifiers)
+        ? args.identifiers.filter((x): x is string => typeof x === "string" && x.length > 0)
+        : [];
+      if (!ids.length) throw new ToolError("USAGE_ERROR", "pass identifiers[]");
+      const source = str(args.source) === "pkg" ? "pkg" : "marketplace";
+      return (needClient(ctx, "console") as ConsoleClient).installPlugins(ids, source);
+    },
+  },
+  {
+    name: "plugin.uninstall",
+    summary: "Uninstall a plugin by installation id. Destructive; requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: {
+      type: "object",
+      properties: { plugin_installation_id: S("plugin installation uuid"), confirm: CONFIRM },
+      required: ["plugin_installation_id", "confirm"],
+    },
+    run: async (args, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).uninstallPlugin(req(args, "plugin_installation_id")),
+  },
+  // ============ P1: features, variables, versions ============
+  {
+    name: "workflow.get_features",
+    summary: "Get the draft workflow features (file upload, suggested questions, TTS, STT, sensitive words).",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).getFeatures(req(a, "app_id")),
+  },
+  {
+    name: "workflow.set_features",
+    summary: "Replace the draft workflow features object. Requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), features: O("features object"), confirm: CONFIRM }, required: ["app_id", "features", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).setFeatures(req(a, "app_id"), obj(a, "features")),
+  },
+  {
+    name: "workflow.list_env_vars",
+    summary: "List draft environment variables.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).listEnvVars(req(a, "app_id")),
+  },
+  {
+    name: "workflow.list_conv_vars",
+    summary: "List draft conversation variables.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).listConvVars(req(a, "app_id")),
+  },
+  {
+    name: "workflow.create_variable",
+    summary: "Create a draft environment/conversation variable. Requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), variable: O("variable definition {name, value_type, value, description}"), variable_type: S("env or conversation (default: env)"), confirm: CONFIRM }, required: ["app_id", "variable", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).createVariable(req(a, "app_id"), obj(a, "variable"), str(a.variable_type)),
+  },
+  {
+    name: "workflow.update_variable",
+    summary: "Update a draft variable by id. Can overwrite secrets; requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), variable_id: S("variable uuid"), variable: O("variable definition"), confirm: CONFIRM }, required: ["app_id", "variable_id", "variable", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).updateVariable(req(a, "app_id"), req(a, "variable_id"), obj(a, "variable")),
+  },
+  {
+    name: "workflow.delete_variable",
+    summary: "Delete a draft variable. Destructive; requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), variable_id: S("variable uuid"), confirm: CONFIRM }, required: ["app_id", "variable_id", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).deleteVariable(req(a, "app_id"), req(a, "variable_id")),
+  },
+  {
+    name: "workflow.list_versions",
+    summary: "List published workflow versions.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).listVersions(req(a, "app_id")),
+  },
+  {
+    name: "workflow.get_version",
+    summary: "Get one published workflow version.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), workflow_id: S("workflow version id") }, required: ["app_id", "workflow_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).getVersion(req(a, "app_id"), req(a, "workflow_id")),
+  },
+  {
+    name: "workflow.restore",
+    summary: "Restore a published version as the draft. Overwrites the current draft; requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), workflow_id: S("workflow version id"), confirm: CONFIRM }, required: ["app_id", "workflow_id", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).restoreVersion(req(a, "app_id"), req(a, "workflow_id")),
+  },
+  {
+    name: "workflow.delete_version",
+    summary: "Delete a published workflow version. Destructive; requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), workflow_id: S("workflow version id"), confirm: CONFIRM }, required: ["app_id", "workflow_id", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).deleteVersion(req(a, "app_id"), req(a, "workflow_id")),
+  },
+  // ============ P1: app metadata + import ============
+  {
+    name: "app.copy",
+    summary: "Duplicate an app. Requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), confirm: CONFIRM }, required: ["app_id", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).copyApp(req(a, "app_id")),
+  },
+  {
+    name: "app.rename",
+    summary: "Rename an app.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), name: S("new name") }, required: ["app_id", "name"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).renameApp(req(a, "app_id"), req(a, "name")),
+  },
+  {
+    name: "app.set_icon",
+    summary: "Set an app icon.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), icon: S("emoji or url"), icon_type: S("emoji|image"), icon_background: S("hex color") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).setAppIcon(req(a, "app_id"), pick(a, ["icon", "icon_type", "icon_background"])),
+  },
+  {
+    name: "app.convert",
+    summary: "Convert an app to workflow mode. Requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), name: S(""), icon: S(""), icon_type: S(""), icon_background: S(""), confirm: CONFIRM }, required: ["app_id", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).convertApp(req(a, "app_id"), pick(a, ["name", "icon", "icon_type", "icon_background"])),
+  },
+  {
+    name: "app.import",
+    summary: "Import an app from DSL through console cookies or OpenAPI. Handles the 2-step confirm flow; requires confirm=true.",
+    confirm: true,
+    schema: { type: "object", properties: { workspace_id: S("target workspace; required only for OpenAPI fallback"), yaml: S("DSL YAML content"), yaml_url: S("...or YAML URL"), name: S("override name"), description: S(""), confirm: CONFIRM }, required: ["confirm"] },
+    run: async (a, ctx) => {
+      const body: Record<string, unknown> = {};
+      const yaml = str(a.yaml);
+      if (yaml) {
+        assertDslVersion(yaml);
+        body.mode = "yaml-content";
+        body.yaml_content = yaml;
+      }
+      else if (str(a.yaml_url)) { body.mode = "yaml-url"; body.yaml_url = str(a.yaml_url); }
+      else throw new ToolError("USAGE_ERROR", "pass yaml (content) or yaml_url");
+      assertPublicYamlUrl(str(a.yaml_url));
+      if (str(a.name)) body.name = str(a.name);
+      if (str(a.description)) body.description = str(a.description);
+      const consoleClient = ctx.console;
+      const openapiClient = ctx.openapi;
+      if (!consoleClient && !openapiClient) {
+        throw new ToolError("AUTH_REQUIRED", "app.import needs console cookies or an OpenAPI token");
+      }
+      const wid = str(a.workspace_id);
+      if (!consoleClient && !wid) {
+        throw new ToolError("USAGE_ERROR", "workspace_id is required for OpenAPI app.import");
+      }
+      const imp = consoleClient
+        ? await consoleClient.importDsl(body)
+        : await openapiClient!.importDsl(wid!, body);
+      if (!imp.ok) return imp;
+      const data = (imp.data ?? {}) as Record<string, unknown>;
+      const importId = str(data.import_id) ?? str(data.id);
+      const pending = data.status === "pending"
+        || data.status === "completed_but_needs_plugin_install"
+        || data.result === "pending"
+        || (importId && data.result === undefined && !str(data.app_id));
+      if (importId && pending) {
+        const conf = consoleClient
+          ? await consoleClient.confirmImport(importId)
+          : await openapiClient!.confirmImport(wid!, importId);
+        return conf.ok ? ok({ imported: true, confirmed: true, ...(conf.data as Record<string, unknown> ?? {}) }) : conf;
+      }
+      return ok({ imported: true, confirmed: false, ...data });
+    },
+  },
+  {
+    name: "app.restore",
+    summary: "Import app DSL files from a local backup directory. Dry-run is safe; real restore requires confirm=true.",
+    schema: {
+      type: "object",
+      properties: {
+        path: S("local backup directory"),
+        workspace_id: S("target workspace; required only for OpenAPI fallback"),
+        on_conflict: { type: "string", enum: ["skip", "create"], description: "default skip; requires a difywf manifest" },
+        dry_run: B("list the restore plan without importing"),
+        confirm: CONFIRM,
+      },
+      required: ["path"],
+    },
+    run: async (args, ctx) => {
+      const dryRun = args.dry_run === true;
+      if (!dryRun && args.confirm !== true) {
+        return err("CONFIRM_REQUIRED", "app.restore creates apps; pass confirm=true (CLI: --yes) or use dry_run=true");
+      }
+      const onConflict = str(args.on_conflict) === "create" ? "create" : "skip";
+      const dir = path.resolve(req(args, "path"));
+      if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+        return err("USAGE_ERROR", `restore path is not a directory: ${dir}`);
+      }
+      const yamlFiles = fs.readdirSync(dir, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && /\.ya?ml$/i.test(entry.name))
+        .map((entry) => entry.name)
+        .sort();
+      if (!yamlFiles.length) return ok({ restore_path: dir, dry_run: dryRun, imported: [], skipped: [], failed: [] });
+
+      const manifestPath = path.join(dir, "manifest.json");
+      const manifestFiles: Array<Record<string, unknown>> = [];
+      let manifestFound = false;
+      if (fs.existsSync(manifestPath)) {
+        manifestFound = true;
+        try {
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+          if (Array.isArray(manifest.files)) {
+            for (const file of manifest.files) {
+              if (file && typeof file === "object") manifestFiles.push(file as Record<string, unknown>);
+            }
+          }
+        } catch {
+          return err("USAGE_ERROR", `invalid backup manifest: ${manifestPath}`);
+        }
+      }
+
+      const listed = await listAllApps(ctx);
+      if (!listed.ok) return listed;
+      const existingNames = new Set(listed.data.map((app) => app.name.toLowerCase()));
+      const imported: Array<Record<string, unknown>> = [];
+      const skipped: Array<Record<string, unknown>> = [];
+      const failed: Array<Record<string, unknown>> = [];
+
+      for (const file of yamlFiles) {
+        const yaml = fs.readFileSync(path.join(dir, file), "utf8");
+        assertDslVersion(yaml);
+        const meta = manifestFiles.find((item) => str(item.file) === file);
+        const name = str(meta?.name);
+        const conflict = !!name && existingNames.has(name.toLowerCase());
+        if (conflict && onConflict === "skip") {
+          skipped.push({ file, reason: "name_conflict", name });
+          continue;
+        }
+        if (dryRun) {
+          imported.push({ file, name: name ?? null, action: conflict ? "create_conflicting_name" : "create" });
+          continue;
+        }
+
+        const importTool = tools.find((tool) => tool.name === "app.import")!;
+        let result: Result<unknown>;
+        try {
+          result = await importTool.run({ yaml, workspace_id: str(args.workspace_id), confirm: true }, ctx);
+        } catch (e) {
+          if (!(e instanceof ToolError)) throw e;
+          failed.push({ file, name: name ?? null, error: { code: e.code, message: e.message, retryable: e.retryable } });
+          continue;
+        }
+        if (result.ok) {
+          const data = (result.data ?? {}) as Record<string, unknown>;
+          imported.push({ file, name: name ?? null, app_id: str(data.app_id) ?? null });
+        } else {
+          failed.push({ file, name: name ?? null, error: result.error });
+        }
+      }
+
+      const summary = { restore_path: dir, dry_run: dryRun, manifest_found: manifestFound, imported, skipped, failed };
+      if (failed.length) {
+        return err("SERVER_ERROR", `${failed.length} of ${yamlFiles.length} DSL import(s) failed`, {
+          details: summary,
+        });
+      }
+      return ok(summary);
+    },
+  },
+  {
+    name: "app.check_deps",
+    summary: "Check plugin dependencies for an app being imported. Console cookies first; OpenAPI token fallback.",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) =>
+      consoleFirst(
+        ctx,
+        (c) => c.checkDependencies(req(a, "app_id")),
+        (o) => o.checkDependencies(req(a, "app_id")),
+      ),
+  },
+  {
+    name: "app.chat",
+    summary: "Send a chat/agent message (SSE). Console cookies.",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: {
+        app_id: S("app uuid"),
+        query: S("user message"),
+        inputs: O("input variables"),
+        conversation_id: S("existing conversation id"),
+        files: { type: "array" },
+      },
+      required: ["app_id", "query"],
+    },
+    run: async (a, ctx) => {
+      const body: Record<string, unknown> = {
+        query: req(a, "query"),
+        inputs: a.inputs && typeof a.inputs === "object" ? a.inputs : {},
+      };
+      if (str(a.conversation_id)) body.conversation_id = str(a.conversation_id);
+      if (Array.isArray(a.files)) body.files = a.files;
+      return (needClient(ctx, "console") as ConsoleClient).chatMessages(req(a, "app_id"), body);
+    },
+  },
+  {
+    name: "app.complete",
+    summary: "Run a completion-mode app (SSE). Console cookies.",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: { app_id: S("app uuid"), inputs: O("input variables"), query: S("optional query text") },
+      required: ["app_id", "inputs"],
+    },
+    run: async (a, ctx) => {
+      const body: Record<string, unknown> = { inputs: obj(a, "inputs") };
+      if (str(a.query)) body.query = str(a.query);
+      return (needClient(ctx, "console") as ConsoleClient).completionMessages(req(a, "app_id"), body);
+    },
+  },
+  // ============ P1: triggers ============
+  {
+    name: "trigger.list",
+    summary: "List triggers for an app.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).listTriggers(req(a, "app_id")),
+  },
+  {
+    name: "trigger.create",
+    summary: "Create a trigger (schedule/webhook) for an app. Requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), trigger: O("trigger definition"), confirm: CONFIRM }, required: ["app_id", "trigger", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).createTrigger(req(a, "app_id"), obj(a, "trigger")),
+  },
+  {
+    name: "trigger.enable",
+    summary: "Enable or disable triggers for an app. Requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), enabled: B("true to enable"), confirm: CONFIRM }, required: ["app_id", "enabled", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).enableTrigger(req(a, "app_id"), { enabled: a.enabled === true }),
+  },
+  {
+    name: "trigger.webhook",
+    summary: "Get the webhook trigger URL for an app.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).webhookTrigger(req(a, "app_id")),
+  },
+  {
+    name: "workflow.trigger_run",
+    summary: "Run a specific trigger.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), inputs: O("trigger inputs") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).triggerRun(req(a, "app_id"), a.inputs && typeof a.inputs === "object" ? a.inputs as Record<string, unknown> : {}),
+  },
+  {
+    name: "workflow.trigger_run_all",
+    summary: "Run all triggers for an app.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).triggerRunAll(req(a, "app_id"), {}),
+  },
+  // ============ P1: workspaces, files, HITL (OpenAPI) ============
+  {
+    name: "workspace.list",
+    summary: "List workspaces you can access.",
+    needs: "openapi",
+    schema: { type: "object", properties: {} },
+    run: async (_a, ctx) => (clientAny(ctx)).listWorkspaces(),
+  },
+  {
+    name: "workspace.get",
+    summary: "Describe one workspace (or the current workspace when workspace_id is omitted on console).",
+    schema: { type: "object", properties: { workspace_id: S("workspace id") } },
+    run: async (a, ctx) => {
+      if (ctx.console) return ctx.console.getWorkspace(str(a.workspace_id));
+      if (ctx.openapi) return ctx.openapi.getWorkspace(req(a, "workspace_id"));
+      throw new ToolError("AUTH_REQUIRED", "workspace.get needs console cookies or an OpenAPI token");
+    },
+  },
+  {
+    name: "workspace.switch",
+    summary: "Switch the active workspace and persist workspace_id in the local store.",
+    schema: { type: "object", properties: { workspace_id: S("workspace id") }, required: ["workspace_id"] },
+    run: async (a, ctx) => {
+      const id = req(a, "workspace_id");
+      const result = await consoleFirst(
+        ctx,
+        (c) => c.switchWorkspace(id),
+        (o) => o.switchWorkspace(id),
+      );
+      if (result.ok && ctx.cfg.baseUrl) storeWorkspace(ctx.cfg.baseUrl, id);
+      return result;
+    },
+  },
+  {
+    name: "workspace.members",
+    summary: "List workspace members.",
+    schema: { type: "object", properties: { workspace_id: S("workspace id") } },
+    run: async (a, ctx) => {
+      if (ctx.console) return ctx.console.listMembers(str(a.workspace_id));
+      if (ctx.openapi) return ctx.openapi.listMembers(req(a, "workspace_id"));
+      throw new ToolError("AUTH_REQUIRED", "workspace.members needs console cookies or an OpenAPI token");
+    },
+  },
+  {
+    name: "workspace.invite_members",
+    summary: "Invite members by email. Body: {emails: string[], role, language?}. confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: {
+      type: "object",
+      properties: {
+        emails: { type: "array", items: { type: "string" }, description: "email addresses to invite" },
+        role: S("role: owner | admin | editor | normal | dataset_operator"),
+        language: S("invite email language, e.g. en-US"),
+        confirm: CONFIRM,
+      },
+      required: ["emails", "role", "confirm"],
+    },
+    run: async (a, ctx) => {
+      const emails = a.emails;
+      if (!Array.isArray(emails) || !emails.every((e) => typeof e === "string" && e)) {
+        throw new ToolError("USAGE_ERROR", "emails must be a non-empty string array");
+      }
+      const body: Record<string, unknown> = { emails, role: req(a, "role") };
+      if (str(a.language)) body.language = str(a.language);
+      return (needClient(ctx, "console") as ConsoleClient).inviteMembers(body);
+    },
+  },
+  {
+    name: "workspace.update_member_role",
+    summary: "Update a workspace member's role. confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: {
+      type: "object",
+      properties: { member_id: S("member uuid"), role: S("new role"), confirm: CONFIRM },
+      required: ["member_id", "role", "confirm"],
+    },
+    run: async (a, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).updateMemberRole(req(a, "member_id"), req(a, "role")),
+  },
+  {
+    name: "workspace.remove_member",
+    summary: "Remove a workspace member. confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: {
+      type: "object",
+      properties: { member_id: S("member uuid"), confirm: CONFIRM },
+      required: ["member_id", "confirm"],
+    },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).removeMember(req(a, "member_id")),
+  },
+  {
+    name: "file.upload",
+    summary: "Upload a file. Console uses POST /files/upload (app_id optional). OpenAPI requires app_id. Pass {name, content_b64, mime?} for multipart.",
+    schema: { type: "object", properties: { app_id: S("app uuid (required for OpenAPI)"), file: O("file metadata or {name, content_b64, mime?}") }, required: ["file"] },
+    run: async (a, ctx) => {
+      if (ctx.console) return ctx.console.uploadFile(obj(a, "file"));
+      if (ctx.openapi) {
+        if (!str(a.app_id)) throw new ToolError("USAGE_ERROR", "app_id is required for OpenAPI file.upload");
+        return ctx.openapi.uploadFile(str(a.app_id)!, obj(a, "file"));
+      }
+      throw new ToolError("AUTH_REQUIRED", "file.upload needs console cookies or an OpenAPI token");
+    },
+  },
+  {
+    name: "workflow.hitl_preview",
+    summary: "Preview a human-input form node before submission.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), node_id: S("human-input node id"), inputs: O("preview inputs") }, required: ["app_id", "node_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).hitlPreview(req(a, "app_id"), req(a, "node_id"), a.inputs && typeof a.inputs === "object" ? a.inputs as Record<string, unknown> : {}),
+  },
+  {
+    name: "workflow.hitl_submit",
+    summary: "Submit a human-input form node.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), node_id: S("human-input node id"), form_data: O("form values") }, required: ["app_id", "node_id", "form_data"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).hitlSubmit(req(a, "app_id"), req(a, "node_id"), obj(a, "form_data")),
+  },
+  // ============ P2: runs, stats ============
+  {
+    name: "runs.list",
+    summary: "List workflow runs.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), page: { type: "number" }, limit: { type: "number" }, status: S("filter by status") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).listRuns(req(a, "app_id"), { page: num(a.page), limit: num(a.limit), status: str(a.status) }),
+  },
+  {
+    name: "runs.get",
+    summary: "Get one workflow run.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), run_id: S("run id") }, required: ["app_id", "run_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).getRun(req(a, "app_id"), req(a, "run_id")),
+  },
+  {
+    name: "runs.node_executions",
+    summary: "Get node executions for a run.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), run_id: S("run id") }, required: ["app_id", "run_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).runNodeExecutions(req(a, "app_id"), req(a, "run_id")),
+  },
+  {
+    name: "runs.export",
+    summary: "Export a run's full trace.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), run_id: S("run id") }, required: ["app_id", "run_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).exportRun(req(a, "app_id"), req(a, "run_id")),
+  },
+  {
+    name: "stats.daily_conversations",
+    summary: "Daily conversation count stats.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), start: S("ISO start"), end: S("ISO end") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).stats(req(a, "app_id"), "daily-conversations", { start: str(a.start), end: str(a.end) }),
+  },
+  {
+    name: "stats.daily_terminals",
+    summary: "Daily terminal count stats.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), start: S("ISO start"), end: S("ISO end") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).stats(req(a, "app_id"), "daily-terminals", { start: str(a.start), end: str(a.end) }),
+  },
+  {
+    name: "stats.token_costs",
+    summary: "Token cost stats.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), start: S("ISO start"), end: S("ISO end") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).stats(req(a, "app_id"), "token-costs", { start: str(a.start), end: str(a.end) }),
+  },
+  {
+    name: "stats.average_app_interactions",
+    summary: "Average app interaction stats.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), start: S("ISO start"), end: S("ISO end") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).stats(req(a, "app_id"), "average-app-interactions", { start: str(a.start), end: str(a.end) }),
+  },
+  {
+    name: "stats.online_users",
+    summary: "List online users across workflows.",
+    needs: "console",
+    schema: { type: "object", properties: { page: { type: "number" }, limit: { type: "number" } } },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).onlineUsers({ page: num(a.page), limit: num(a.limit) }),
+  },
+  // ============ P2: comments, annotations, audio ============
+  {
+    name: "comment.list",
+    summary: "List workflow comments.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).listComments(req(a, "app_id")),
+  },
+  {
+    name: "comment.add",
+    summary: "Add a workflow comment.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), comment: O("comment body") }, required: ["app_id", "comment"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).addComment(req(a, "app_id"), obj(a, "comment")),
+  },
+  {
+    name: "comment.resolve",
+    summary: "Resolve a workflow comment.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), comment_id: S("comment id") }, required: ["app_id", "comment_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).resolveComment(req(a, "app_id"), req(a, "comment_id")),
+  },
+  {
+    name: "annotation.list",
+    summary: "List annotation replies.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).listAnnotations(req(a, "app_id")),
+  },
+  {
+    name: "annotation.add",
+    summary: "Add an annotation reply.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), annotation: O("annotation body") }, required: ["app_id", "annotation"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).addAnnotation(req(a, "app_id"), obj(a, "annotation")),
+  },
+  {
+    name: "annotation.delete",
+    summary: "Delete an annotation. Destructive; requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), annotation_id: S("annotation id"), confirm: CONFIRM }, required: ["app_id", "annotation_id", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).deleteAnnotation(req(a, "app_id"), req(a, "annotation_id")),
+  },
+  {
+    name: "audio.transcribe",
+    summary: "Transcribe audio to text (speech-to-text).",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), file: O("audio file reference") }, required: ["app_id", "file"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).audioToText(req(a, "app_id"), obj(a, "file")),
+  },
+  {
+    name: "audio.synthesize",
+    summary: "Synthesize audio from text (text-to-speech).",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), body: O("tts body: text, voice, ...") }, required: ["app_id", "body"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).textToAudio(req(a, "app_id"), obj(a, "body")),
+  },
+  {
+    name: "audio.voices",
+    summary: "List available TTS voices.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), language: S("language code, e.g. en-US or zh-Hans") }, required: ["app_id", "language"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).listVoices(req(a, "app_id"), req(a, "language")),
+  },
+  // ============ P2: rag, knowledge, explore, archive (read-only / run) ============
+  {
+    name: "rag.list_datasets",
+    summary: "List RAG pipeline datasets.",
+    needs: "console",
+    schema: { type: "object", properties: {} },
+    run: async (_a, ctx) => (needClient(ctx, "console") as ConsoleClient).listRagDatasets(),
+  },
+  {
+    name: "rag.list_templates",
+    summary: "List RAG pipeline templates.",
+    needs: "console",
+    schema: { type: "object", properties: {} },
+    run: async (_a, ctx) => (needClient(ctx, "console") as ConsoleClient).listRagTemplates(),
+  },
+  // --- classic knowledge base (datasets / documents / segments) ---
+  {
+    name: "knowledge.list_datasets",
+    summary: "List classic knowledge-base datasets (same console /datasets list as rag.list_datasets).",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: { page: { type: "number" }, limit: { type: "number" }, keyword: S("search keyword") },
+    },
+    run: async (a, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).listRagDatasets({
+        page: num(a.page),
+        limit: num(a.limit),
+        keyword: str(a.keyword),
+      }),
+  },
+  {
+    name: "knowledge.create_dataset",
+    summary: "Create a classic knowledge dataset. Pass name plus optional description/indexing_technique/permission/provider.",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: {
+        name: S("dataset name"),
+        description: S("optional description"),
+        indexing_technique: S("high_quality | economy"),
+        permission: S("only_me | all_team_members | partial_members"),
+        provider: S("vendor | external"),
+        body: O("full create body (overrides individual fields when set)"),
+      },
+      required: ["name"],
+    },
+    run: async (a, ctx) => {
+      const body: Record<string, unknown> =
+        a.body && typeof a.body === "object" && !Array.isArray(a.body)
+          ? { ...(a.body as Record<string, unknown>) }
+          : { name: req(a, "name") };
+      if (!body.name) body.name = req(a, "name");
+      for (const key of ["description", "indexing_technique", "permission", "provider"] as const) {
+        if (str(a[key]) && body[key] === undefined) body[key] = str(a[key]);
+      }
+      return (needClient(ctx, "console") as ConsoleClient).createDataset(body);
+    },
+  },
+  {
+    name: "knowledge.get_dataset",
+    summary: "Get one knowledge dataset by id.",
+    needs: "console",
+    schema: { type: "object", properties: { dataset_id: S("dataset uuid") }, required: ["dataset_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).getDataset(req(a, "dataset_id")),
+  },
+  {
+    name: "knowledge.update_dataset",
+    summary: "Patch a knowledge dataset (name, description, retrieval_model, ...).",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: { dataset_id: S("dataset uuid"), body: O("PATCH body") },
+      required: ["dataset_id", "body"],
+    },
+    run: async (a, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).updateDataset(req(a, "dataset_id"), obj(a, "body")),
+  },
+  {
+    name: "knowledge.delete_dataset",
+    summary: "Delete a knowledge dataset. confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: {
+      type: "object",
+      properties: { dataset_id: S("dataset uuid"), confirm: CONFIRM },
+      required: ["dataset_id", "confirm"],
+    },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).deleteDataset(req(a, "dataset_id")),
+  },
+  {
+    name: "knowledge.list_documents",
+    summary: "List documents in a knowledge dataset.",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: {
+        dataset_id: S("dataset uuid"),
+        page: { type: "number" },
+        limit: { type: "number" },
+        keyword: S("search keyword"),
+        status: S("indexing status filter"),
+      },
+      required: ["dataset_id"],
+    },
+    run: async (a, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).listDocuments(req(a, "dataset_id"), {
+        page: num(a.page),
+        limit: num(a.limit),
+        keyword: str(a.keyword),
+        status: str(a.status),
+      }),
+  },
+  {
+    name: "knowledge.get_document",
+    summary: "Get one document in a knowledge dataset.",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: { dataset_id: S("dataset uuid"), document_id: S("document uuid") },
+      required: ["dataset_id", "document_id"],
+    },
+    run: async (a, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).getDocument(req(a, "dataset_id"), req(a, "document_id")),
+  },
+  {
+    name: "knowledge.create_document",
+    summary:
+      "Create documents in a dataset. Pass KnowledgeConfig via body, or shortcut file_ids (from file.upload) + indexing_technique.",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: {
+        dataset_id: S("dataset uuid"),
+        body: O("full KnowledgeConfig body"),
+        file_ids: { type: "array", items: { type: "string" }, description: "upload_file ids from file.upload" },
+        indexing_technique: S("high_quality | economy (with file_ids shortcut)"),
+        name: S("optional document name (file_ids shortcut)"),
+      },
+      required: ["dataset_id"],
+    },
+    run: async (a, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).createDocument(
+        req(a, "dataset_id"),
+        buildKnowledgeDocumentBody(a),
+      ),
+  },
+  {
+    name: "knowledge.delete_document",
+    summary: "Delete a document from a dataset. confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: {
+      type: "object",
+      properties: { dataset_id: S("dataset uuid"), document_id: S("document uuid"), confirm: CONFIRM },
+      required: ["dataset_id", "document_id", "confirm"],
+    },
+    run: async (a, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).deleteDocument(req(a, "dataset_id"), req(a, "document_id")),
+  },
+  {
+    name: "knowledge.rename_document",
+    summary: "Rename a document in a dataset.",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: { dataset_id: S("dataset uuid"), document_id: S("document uuid"), name: S("new name") },
+      required: ["dataset_id", "document_id", "name"],
+    },
+    run: async (a, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).renameDocument(
+        req(a, "dataset_id"),
+        req(a, "document_id"),
+        req(a, "name"),
+      ),
+  },
+  {
+    name: "knowledge.indexing_status",
+    summary: "Get indexing status for a dataset (or one document when document_id is set).",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: { dataset_id: S("dataset uuid"), document_id: S("optional document uuid") },
+      required: ["dataset_id"],
+    },
+    run: async (a, ctx) => {
+      const c = needClient(ctx, "console") as ConsoleClient;
+      const docId = str(a.document_id);
+      return docId
+        ? c.documentIndexingStatus(req(a, "dataset_id"), docId)
+        : c.datasetIndexingStatus(req(a, "dataset_id"));
+    },
+  },
+  {
+    name: "knowledge.hit_testing",
+    summary: "Run retrieval hit-testing against a dataset. Body needs at least {query}.",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: {
+        dataset_id: S("dataset uuid"),
+        query: S("query text (shortcut when body omitted)"),
+        body: O("full HitTestingPayload"),
+      },
+      required: ["dataset_id"],
+    },
+    run: async (a, ctx) => {
+      const body =
+        a.body && typeof a.body === "object" && !Array.isArray(a.body)
+          ? (a.body as Record<string, unknown>)
+          : { query: req(a, "query") };
+      if (!nonEmptyStr(body.query) && str(a.query)) body.query = str(a.query);
+      if (!nonEmptyStr(body.query)) throw new ToolError("USAGE_ERROR", "query or body.query is required");
+      return (needClient(ctx, "console") as ConsoleClient).hitTesting(req(a, "dataset_id"), body);
+    },
+  },
+  {
+    name: "knowledge.list_segments",
+    summary: "List segments of a document.",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: {
+        dataset_id: S("dataset uuid"),
+        document_id: S("document uuid"),
+        page: { type: "number" },
+        limit: { type: "number" },
+        keyword: S("search keyword"),
+        enabled: S("true | false"),
+      },
+      required: ["dataset_id", "document_id"],
+    },
+    run: async (a, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).listSegments(req(a, "dataset_id"), req(a, "document_id"), {
+        page: num(a.page),
+        limit: num(a.limit),
+        keyword: str(a.keyword),
+        enabled: str(a.enabled),
+      }),
+  },
+  {
+    name: "knowledge.add_segment",
+    summary: "Add a segment to a document. Body: {content, keywords?, answer?} or content shortcut.",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: {
+        dataset_id: S("dataset uuid"),
+        document_id: S("document uuid"),
+        content: S("segment text (shortcut)"),
+        keywords: { type: "array", items: { type: "string" } },
+        answer: S("optional Q&A answer"),
+        body: O("full segment create body"),
+      },
+      required: ["dataset_id", "document_id"],
+    },
+    run: async (a, ctx) => {
+      let body: Record<string, unknown>;
+      if (a.body && typeof a.body === "object" && !Array.isArray(a.body)) {
+        body = { ...(a.body as Record<string, unknown>) };
+      } else {
+        body = { content: req(a, "content") };
+      }
+      if (!nonEmptyStr(body.content) && str(a.content)) body.content = str(a.content);
+      if (!nonEmptyStr(body.content)) throw new ToolError("USAGE_ERROR", "content or body.content is required");
+      if (Array.isArray(a.keywords) && body.keywords === undefined) body.keywords = a.keywords;
+      if (str(a.answer) && body.answer === undefined) body.answer = str(a.answer);
+      return (needClient(ctx, "console") as ConsoleClient).addSegment(
+        req(a, "dataset_id"),
+        req(a, "document_id"),
+        body,
+      );
+    },
+  },
+  {
+    name: "knowledge.update_segment",
+    summary: "Update a segment (content, keywords, enabled, ...).",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: {
+        dataset_id: S("dataset uuid"),
+        document_id: S("document uuid"),
+        segment_id: S("segment uuid"),
+        body: O("PATCH body"),
+      },
+      required: ["dataset_id", "document_id", "segment_id", "body"],
+    },
+    run: async (a, ctx) =>
+      (needClient(ctx, "console") as ConsoleClient).updateSegment(
+        req(a, "dataset_id"),
+        req(a, "document_id"),
+        req(a, "segment_id"),
+        obj(a, "body"),
+      ),
+  },
+  {
+    name: "knowledge.delete_segments",
+    summary: "Delete one or more segments. confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: {
+      type: "object",
+      properties: {
+        dataset_id: S("dataset uuid"),
+        document_id: S("document uuid"),
+        segment_ids: { type: "array", items: { type: "string" }, description: "segment uuids to delete" },
+        confirm: CONFIRM,
+      },
+      required: ["dataset_id", "document_id", "segment_ids", "confirm"],
+    },
+    run: async (a, ctx) => {
+      const ids = a.segment_ids;
+      if (!Array.isArray(ids) || !ids.length || !ids.every((id) => typeof id === "string" && id)) {
+        throw new ToolError("USAGE_ERROR", "segment_ids must be a non-empty string array");
+      }
+      return (needClient(ctx, "console") as ConsoleClient).deleteSegments(
+        req(a, "dataset_id"),
+        req(a, "document_id"),
+        ids as string[],
+      );
+    },
+  },
+  {
+    name: "explore.run",
+    summary: "Run an installed (explore) app.",
+    needs: "console",
+    schema: { type: "object", properties: { installed_app_id: S("installed app id"), inputs: O("run inputs") }, required: ["installed_app_id", "inputs"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).runInstalledApp(req(a, "installed_app_id"), obj(a, "inputs")),
+  },
+  {
+    name: "explore.stop",
+    summary: "Stop a running installed app task.",
+    needs: "console",
+    schema: { type: "object", properties: { installed_app_id: S("installed app id"), task_id: S("task id") }, required: ["installed_app_id", "task_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).stopInstalledApp(req(a, "installed_app_id"), req(a, "task_id")),
+  },
+  {
+    name: "archive.list",
+    summary: "List workflow run archives.",
+    needs: "console",
+    schema: { type: "object", properties: { page: { type: "number" }, limit: { type: "number" } } },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).listRunArchives({ page: num(a.page), limit: num(a.limit) }),
+  },
+  {
+    name: "archive.download",
+    summary: "Request a run archive download.",
+    needs: "console",
+    schema: { type: "object", properties: { body: O("download request body") }, required: ["body"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).downloadRunArchive(obj(a, "body")),
+  },
+
+  // ============ P3: annotation completion ============
+  {
+    name: "annotation.reply_action",
+    summary: "Enable/disable annotation reply (enable triggers server-side indexing). confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), action: { type: "string", enum: ["enable", "disable"] }, confirm: CONFIRM }, required: ["app_id", "action", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).annotationReplyAction(req(a, "app_id"), req(a, "action")),
+  },
+  {
+    name: "annotation.reply_status",
+    summary: "Poll an annotation-reply enable/disable indexing job.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), action: S("enable|disable"), job_id: S("job id") }, required: ["app_id", "action", "job_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).annotationReplyStatus(req(a, "app_id"), req(a, "action"), req(a, "job_id")),
+  },
+  {
+    name: "annotation.get_settings",
+    summary: "Get annotation reply settings (score threshold, embedding provider/model).",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).getAnnotationSetting(req(a, "app_id")),
+  },
+  {
+    name: "annotation.update_settings",
+    summary: "Update annotation reply settings; re-indexes. confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), setting_id: S("annotation setting id"), settings: O("settings body"), confirm: CONFIRM }, required: ["app_id", "setting_id", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).updateAnnotationSetting(req(a, "app_id"), req(a, "setting_id"), obj(a, "settings")),
+  },
+  {
+    name: "annotation.export",
+    summary: "Export annotations (CSV).",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).exportAnnotations(req(a, "app_id")),
+  },
+  {
+    name: "annotation.batch_import",
+    summary: "Batch-import annotations from CSV (multipart file payload). confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), file: O("CSV file payload {name, content_b64}"), confirm: CONFIRM }, required: ["app_id", "file", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).batchImportAnnotations(req(a, "app_id"), obj(a, "file")),
+  },
+  {
+    name: "annotation.import_status",
+    summary: "Poll a batch-import job.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), job_id: S("job id") }, required: ["app_id", "job_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).annotationImportStatus(req(a, "app_id"), req(a, "job_id")),
+  },
+  {
+    name: "annotation.hit_histories",
+    summary: "List hit histories for one annotation.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), annotation_id: S("annotation id") }, required: ["app_id", "annotation_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).annotationHitHistories(req(a, "app_id"), req(a, "annotation_id")),
+  },
+  // ============ P3: RAG pipeline full lifecycle ============
+  {
+    name: "rag.create_dataset",
+    summary: "Create a RAG pipeline dataset from DSL yaml_content.",
+    needs: "console",
+    schema: { type: "object", properties: { body: O("payload: {yaml_content, ...}") }, required: ["body"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).createRagDataset(obj(a, "body")),
+  },
+  {
+    name: "rag.create_empty_dataset",
+    summary: "Create an empty RAG pipeline dataset.",
+    needs: "console",
+    schema: { type: "object", properties: { body: O("payload: {name, description?, ...}") }, required: ["body"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).createEmptyRagDataset(obj(a, "body")),
+  },
+  {
+    name: "rag.get_template",
+    summary: "Get one RAG pipeline template.",
+    needs: "console",
+    schema: { type: "object", properties: { template_id: S("template id") }, required: ["template_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).getRagTemplate(req(a, "template_id")),
+  },
+  {
+    name: "rag.get_draft",
+    summary: "Get a RAG pipeline's draft workflow graph, features, hash.",
+    needs: "console",
+    schema: { type: "object", properties: { pipeline_id: S("pipeline id") }, required: ["pipeline_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).getRagDraft(req(a, "pipeline_id")),
+  },
+  {
+    name: "rag.sync_draft",
+    summary: "Validate and save a RAG pipeline's draft graph. Pass graph or graph_json.",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: {
+        pipeline_id: S("pipeline id"), graph: O("{nodes, edges}"), graph_json: S("graph as a JSON string"),
+        features: O("features"), hash: S("current draft hash"), dry_run: B("validate + return diff without saving"), confirm: CONFIRM,
+      },
+      required: ["pipeline_id"],
+    },
+    run: async (a, ctx) => {
+      const client = needClient(ctx, "console") as ConsoleClient;
+      const graph = parseGraphArg(a);
+      const issues = validateGraph(graph);
+      const errors = issues.filter((i) => i.level === "error");
+      if (errors.length > 0) return err("VALIDATION_FAILED", `${errors.length} error-level issue(s)`, { details: issues });
+      const dryRun = a.dry_run === true;
+      const policy = assertGraphPolicies(graph, a, dryRun);
+      if (policy) return policy;
+      const current = await client.getRagDraft(req(a, "pipeline_id"));
+      if (dryRun) return dryRunBaseline(current, graph, issues);
+      const fields = current.ok ? draftFields(current.data) : {};
+      const body: Record<string, unknown> = {
+        graph,
+        features: a.features ?? fields.features ?? {},
+      };
+      const hash = str(a.hash) ?? fields.hash;
+      if (hash !== undefined) body.hash = hash;
+      return client.syncRagDraft(req(a, "pipeline_id"), body);
+    },
+  },
+  {
+    name: "rag.node_defaults",
+    summary: "Get default node config schema for a RAG pipeline (or all types).",
+    needs: "console",
+    schema: { type: "object", properties: { pipeline_id: S("pipeline id"), block_type: S("node type") }, required: ["pipeline_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).ragNodeDefaults(req(a, "pipeline_id"), str(a.block_type)),
+  },
+  {
+    name: "rag.run_draft",
+    summary: "Run a RAG pipeline's draft workflow.",
+    needs: "console",
+    schema: { type: "object", properties: { pipeline_id: S("pipeline id"), inputs: O("run inputs") }, required: ["pipeline_id", "inputs"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).runRagDraft(req(a, "pipeline_id"), obj(a, "inputs")),
+  },
+  {
+    name: "rag.run_published",
+    summary: "Run a RAG pipeline's published workflow.",
+    needs: "console",
+    schema: { type: "object", properties: { pipeline_id: S("pipeline id"), inputs: O("run inputs") }, required: ["pipeline_id", "inputs"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).runRagPublished(req(a, "pipeline_id"), obj(a, "inputs")),
+  },
+  {
+    name: "rag.run_node",
+    summary: "Run a single draft node in a RAG pipeline for debugging.",
+    needs: "console",
+    schema: { type: "object", properties: { pipeline_id: S("pipeline id"), node_id: S("node id"), inputs: O("input variables") }, required: ["pipeline_id", "node_id", "inputs"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).runRagNode(req(a, "pipeline_id"), req(a, "node_id"), obj(a, "inputs")),
+  },
+  {
+    name: "rag.stop",
+    summary: "Stop a running RAG pipeline task.",
+    needs: "console",
+    schema: { type: "object", properties: { pipeline_id: S("pipeline id"), task_id: S("task id") }, required: ["pipeline_id", "task_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).stopRagTask(req(a, "pipeline_id"), req(a, "task_id")),
+  },
+  {
+    name: "rag.publish",
+    summary: "Publish a RAG pipeline's draft. confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { pipeline_id: S("pipeline id"), body: O("publish body (marked_name, etc.)"), confirm: CONFIRM }, required: ["pipeline_id", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).publishRag(req(a, "pipeline_id"), a.body && typeof a.body === "object" ? a.body as Record<string, unknown> : {}),
+  },
+  {
+    name: "rag.list_versions",
+    summary: "List published RAG pipeline workflow versions.",
+    needs: "console",
+    schema: { type: "object", properties: { pipeline_id: S("pipeline id") }, required: ["pipeline_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).listRagVersions(req(a, "pipeline_id")),
+  },
+  {
+    name: "rag.get_version",
+    summary: "Get one published RAG pipeline workflow version.",
+    needs: "console",
+    schema: { type: "object", properties: { pipeline_id: S("pipeline id"), workflow_id: S("workflow version id") }, required: ["pipeline_id", "workflow_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).getRagVersion(req(a, "pipeline_id"), req(a, "workflow_id")),
+  },
+  {
+    name: "rag.update_version",
+    summary: "Update (PATCH) a published RAG pipeline workflow version's metadata.",
+    needs: "console",
+    schema: { type: "object", properties: { pipeline_id: S("pipeline id"), workflow_id: S("workflow version id"), body: O("update body") }, required: ["pipeline_id", "workflow_id", "body"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).updateRagVersion(req(a, "pipeline_id"), req(a, "workflow_id"), obj(a, "body")),
+  },
+  {
+    name: "rag.restore",
+    summary: "Restore a published RAG pipeline version as draft. confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { pipeline_id: S("pipeline id"), workflow_id: S("workflow version id"), confirm: CONFIRM }, required: ["pipeline_id", "workflow_id", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).restoreRagVersion(req(a, "pipeline_id"), req(a, "workflow_id")),
+  },
+  {
+    name: "rag.delete_version",
+    summary: "Delete a published RAG pipeline version. confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { pipeline_id: S("pipeline id"), workflow_id: S("workflow version id"), confirm: CONFIRM }, required: ["pipeline_id", "workflow_id", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).deleteRagVersion(req(a, "pipeline_id"), req(a, "workflow_id")),
+  },
+  // ============ P3: customized snippets (lifecycle + workflow) ============
+  {
+    name: "snippet.list",
+    summary: "List customized snippets in the workspace.",
+    needs: "console",
+    schema: { type: "object", properties: { page: { type: "number" }, limit: { type: "number" }, keyword: S("search keyword") } },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).listSnippets({ page: num(a.page), limit: num(a.limit), keyword: str(a.keyword) }),
+  },
+  {
+    name: "snippet.create",
+    summary: "Create a customized snippet (type: node|workflow).",
+    needs: "console",
+    schema: { type: "object", properties: { body: O("payload: {type, name, description?, icon_info?, input_fields?}") }, required: ["body"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).createSnippet(obj(a, "body")),
+  },
+  {
+    name: "snippet.get",
+    summary: "Describe one customized snippet.",
+    needs: "console",
+    schema: { type: "object", properties: { snippet_id: S("snippet id") }, required: ["snippet_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).getSnippet(req(a, "snippet_id")),
+  },
+  {
+    name: "snippet.update",
+    summary: "Update a customized snippet (PATCH).",
+    needs: "console",
+    schema: { type: "object", properties: { snippet_id: S("snippet id"), body: O("update body") }, required: ["snippet_id", "body"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).updateSnippet(req(a, "snippet_id"), obj(a, "body")),
+  },
+  {
+    name: "snippet.delete",
+    summary: "Delete a customized snippet. confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { snippet_id: S("snippet id"), confirm: CONFIRM }, required: ["snippet_id", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).deleteSnippet(req(a, "snippet_id")),
+  },
+  {
+    name: "snippet.export",
+    summary: "Export a customized snippet as DSL.",
+    needs: "console",
+    schema: { type: "object", properties: { snippet_id: S("snippet id") }, required: ["snippet_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).exportSnippet(req(a, "snippet_id")),
+  },
+  {
+    name: "snippet.import",
+    summary: "Import a customized snippet from DSL (2-step confirm flow). confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { yaml: S("DSL YAML content"), yaml_url: S("...or YAML URL"), name: S("override name"), confirm: CONFIRM }, required: ["confirm"] },
+    run: async (a, ctx) => {
+      const c = needClient(ctx, "console") as ConsoleClient;
+      const body: Record<string, unknown> = {};
+      if (str(a.yaml)) { body.mode = "yaml-content"; body.yaml_content = str(a.yaml); }
+      else if (str(a.yaml_url)) { body.mode = "yaml-url"; body.yaml_url = str(a.yaml_url); }
+      else throw new ToolError("USAGE_ERROR", "pass yaml (content) or yaml_url");
+      assertPublicYamlUrl(str(a.yaml_url));
+      if (str(a.name)) body.name = str(a.name);
+      const imp = await c.importSnippet(body);
+      if (!imp.ok) return imp;
+      const data = (imp.data ?? {}) as Record<string, unknown>;
+      const importId = str(data.import_id) ?? str(data.id);
+      const pending = data.status === "pending" || data.result === "pending" || (importId && data.result === undefined);
+      if (importId && pending) {
+        const conf = await c.confirmSnippetImport(importId);
+        return conf.ok ? ok({ imported: true, confirmed: true, ...((conf.data as Record<string, unknown>) ?? {}) }) : conf;
+      }
+      return ok({ imported: true, confirmed: false, ...data });
+    },
+  },
+  {
+    name: "snippet.import_confirm",
+    summary: "Confirm a snippet import explicitly by import_id. Requires confirm=true.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { import_id: S("import id"), confirm: CONFIRM }, required: ["import_id", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).confirmSnippetImport(req(a, "import_id")),
+  },
+  {
+    name: "snippet.check_deps",
+    summary: "Check plugin dependencies for a snippet.",
+    needs: "console",
+    schema: { type: "object", properties: { snippet_id: S("snippet id") }, required: ["snippet_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).checkSnippetDeps(req(a, "snippet_id")),
+  },
+  {
+    name: "snippet.get_draft",
+    summary: "Get a snippet's draft workflow graph, features, hash.",
+    needs: "console",
+    schema: { type: "object", properties: { snippet_id: S("snippet id") }, required: ["snippet_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).getSnippetDraft(req(a, "snippet_id")),
+  },
+  {
+    name: "snippet.sync_draft",
+    summary: "Validate and save a snippet's draft graph. Pass graph or graph_json.",
+    needs: "console",
+    schema: {
+      type: "object",
+      properties: {
+        snippet_id: S("snippet id"), graph: O("{nodes, edges}"), graph_json: S("graph as a JSON string"),
+        features: O("features"), hash: S("current draft hash"), dry_run: B("validate + return diff without saving"), confirm: CONFIRM,
+      },
+      required: ["snippet_id"],
+    },
+    run: async (a, ctx) => {
+      const client = needClient(ctx, "console") as ConsoleClient;
+      const graph = parseGraphArg(a);
+      const issues = validateGraph(graph);
+      const errors = issues.filter((i) => i.level === "error");
+      if (errors.length > 0) return err("VALIDATION_FAILED", `${errors.length} error-level issue(s)`, { details: issues });
+      const dryRun = a.dry_run === true;
+      const policy = assertGraphPolicies(graph, a, dryRun);
+      if (policy) return policy;
+      const current = await client.getSnippetDraft(req(a, "snippet_id"));
+      if (dryRun) return dryRunBaseline(current, graph, issues);
+      const fields = current.ok ? draftFields(current.data) : {};
+      const body: Record<string, unknown> = {
+        graph,
+        features: a.features ?? fields.features ?? {},
+      };
+      const hash = str(a.hash) ?? fields.hash;
+      if (hash !== undefined) body.hash = hash;
+      return client.syncSnippetDraft(req(a, "snippet_id"), body);
+    },
+  },
+  {
+    name: "snippet.node_defaults",
+    summary: "Get default node config schema for a snippet workflow.",
+    needs: "console",
+    schema: { type: "object", properties: { snippet_id: S("snippet id") }, required: ["snippet_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).snippetNodeDefaults(req(a, "snippet_id")),
+  },
+  {
+    name: "snippet.publish",
+    summary: "Publish a snippet's draft workflow. confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { snippet_id: S("snippet id"), body: O("publish body"), confirm: CONFIRM }, required: ["snippet_id", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).publishSnippet(req(a, "snippet_id"), a.body && typeof a.body === "object" ? a.body as Record<string, unknown> : {}),
+  },
+  {
+    name: "snippet.list_versions",
+    summary: "List published snippet workflow versions.",
+    needs: "console",
+    schema: { type: "object", properties: { snippet_id: S("snippet id") }, required: ["snippet_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).listSnippetVersions(req(a, "snippet_id")),
+  },
+  {
+    name: "snippet.restore",
+    summary: "Restore a published snippet version as draft. confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { snippet_id: S("snippet id"), workflow_id: S("workflow version id"), confirm: CONFIRM }, required: ["snippet_id", "workflow_id", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).restoreSnippetVersion(req(a, "snippet_id"), req(a, "workflow_id")),
+  },
+  {
+    name: "snippet.update_version",
+    summary: "Update (PATCH) a published snippet workflow version's metadata.",
+    needs: "console",
+    schema: { type: "object", properties: { snippet_id: S("snippet id"), workflow_id: S("workflow version id"), body: O("update body") }, required: ["snippet_id", "workflow_id", "body"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).updateSnippetVersion(req(a, "snippet_id"), req(a, "workflow_id"), obj(a, "body")),
+  },
+  {
+    name: "snippet.run_draft",
+    summary: "Run a snippet's draft workflow with inputs.",
+    needs: "console",
+    schema: { type: "object", properties: { snippet_id: S("snippet id"), inputs: O("run inputs") }, required: ["snippet_id", "inputs"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).runSnippetDraft(req(a, "snippet_id"), obj(a, "inputs")),
+  },
+  {
+    name: "snippet.run_node",
+    summary: "Run a single draft node in a snippet workflow for debugging.",
+    needs: "console",
+    schema: { type: "object", properties: { snippet_id: S("snippet id"), node_id: S("node id"), inputs: O("input variables") }, required: ["snippet_id", "node_id", "inputs"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).runSnippetNode(req(a, "snippet_id"), req(a, "node_id"), obj(a, "inputs")),
+  },
+  {
+    name: "snippet.stop",
+    summary: "Stop a running snippet workflow task.",
+    needs: "console",
+    schema: { type: "object", properties: { snippet_id: S("snippet id"), task_id: S("task id") }, required: ["snippet_id", "task_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).stopSnippetTask(req(a, "snippet_id"), req(a, "task_id")),
+  },
+  {
+    name: "snippet.list_runs",
+    summary: "List snippet workflow runs.",
+    needs: "console",
+    schema: { type: "object", properties: { snippet_id: S("snippet id"), page: { type: "number" }, limit: { type: "number" } }, required: ["snippet_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).listSnippetRuns(req(a, "snippet_id"), { page: num(a.page), limit: num(a.limit) }),
+  },
+  {
+    name: "snippet.get_run",
+    summary: "Get one snippet workflow run.",
+    needs: "console",
+    schema: { type: "object", properties: { snippet_id: S("snippet id"), run_id: S("run id") }, required: ["snippet_id", "run_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).getSnippetRun(req(a, "snippet_id"), req(a, "run_id")),
+  },
+  {
+    name: "snippet.run_node_executions",
+    summary: "Get node executions for a snippet workflow run.",
+    needs: "console",
+    schema: { type: "object", properties: { snippet_id: S("snippet id"), run_id: S("run id") }, required: ["snippet_id", "run_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).snippetRunNodeExecutions(req(a, "snippet_id"), req(a, "run_id")),
+  },
+  // ============ P3: agent config / drive / sandbox ============
+  {
+    name: "agent.config_manifest",
+    summary: "Get the agent config manifest for an app.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentConfigManifest(req(a, "app_id")),
+  },
+  {
+    name: "agent.config_skills",
+    summary: "List agent config skills for an app.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentConfigSkills(req(a, "app_id")),
+  },
+  {
+    name: "agent.config_skill_upload",
+    summary: "Upload a skill to an app's agent config (multipart). confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), file: O("skill file payload"), confirm: CONFIRM }, required: ["app_id", "file", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentConfigSkillUpload(req(a, "app_id"), obj(a, "file")),
+  },
+  {
+    name: "agent.config_skill_inspect",
+    summary: "Inspect one agent config skill by name.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), name: S("skill name") }, required: ["app_id", "name"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentConfigSkillInspect(req(a, "app_id"), req(a, "name")),
+  },
+  {
+    name: "agent.config_skill_preview",
+    summary: "Preview a skill file for an app's agent config.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), name: S("skill name") }, required: ["app_id", "name"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentConfigSkillPreview(req(a, "app_id"), req(a, "name")),
+  },
+  {
+    name: "agent.config_files",
+    summary: "List agent config files for an app.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentConfigFiles(req(a, "app_id")),
+  },
+  {
+    name: "agent.config_file_upload",
+    summary: "Upload a file to an app's agent config (multipart). confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { app_id: S("app uuid"), file: O("file payload"), confirm: CONFIRM }, required: ["app_id", "file", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentConfigFileUpload(req(a, "app_id"), obj(a, "file")),
+  },
+  {
+    name: "agent.drive_files",
+    summary: "List agent drive files for an app.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentDriveFiles(req(a, "app_id")),
+  },
+  {
+    name: "agent.drive_skills",
+    summary: "List agent drive skills for an app.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid") }, required: ["app_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentDriveSkills(req(a, "app_id")),
+  },
+  {
+    name: "agent.drive_skill_inspect",
+    summary: "Inspect one agent drive skill by path.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), skill_path: S("skill path") }, required: ["app_id", "skill_path"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentDriveSkillInspect(req(a, "app_id"), req(a, "skill_path")),
+  },
+  {
+    name: "agent.drive_preview",
+    summary: "Preview a drive file (truncated text). Params: {key, node_id?}.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), params: O("query: {key, node_id?}") }, required: ["app_id", "params"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentDrivePreview(req(a, "app_id"), obj(a, "params")),
+  },
+  {
+    name: "agent.drive_download",
+    summary: "Get a signed download URL for a drive file. Params: {key, node_id?}.",
+    needs: "console",
+    schema: { type: "object", properties: { app_id: S("app uuid"), params: O("query: {key, node_id?}") }, required: ["app_id", "params"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentDriveDownload(req(a, "app_id"), obj(a, "params")),
+  },
+  {
+    name: "agent.sandbox_info",
+    summary: "Get sandbox info for an agent.",
+    needs: "console",
+    schema: { type: "object", properties: { agent_id: S("agent id") }, required: ["agent_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentSandboxInfo(req(a, "agent_id")),
+  },
+  {
+    name: "agent.sandbox_files",
+    summary: "List files in an agent's sandbox.",
+    needs: "console",
+    schema: { type: "object", properties: { agent_id: S("agent id") }, required: ["agent_id"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentSandboxFiles(req(a, "agent_id")),
+  },
+  {
+    name: "agent.sandbox_read",
+    summary: "Read a file in an agent's sandbox. Params: {conversation_id, path}.",
+    needs: "console",
+    schema: { type: "object", properties: { agent_id: S("agent id"), params: O("query: {conversation_id, path}") }, required: ["agent_id", "params"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentSandboxRead(req(a, "agent_id"), obj(a, "params")),
+  },
+  {
+    name: "agent.sandbox_upload",
+    summary: "Upload a file to an agent's sandbox (multipart). confirm=true required.",
+    needs: "console",
+    confirm: true,
+    schema: { type: "object", properties: { agent_id: S("agent id"), file: O("file payload"), confirm: CONFIRM }, required: ["agent_id", "file", "confirm"] },
+    run: async (a, ctx) => (needClient(ctx, "console") as ConsoleClient).agentSandboxUpload(req(a, "agent_id"), obj(a, "file")),
+  },
+
+];
+
+export async function runTool(tool: Tool, args: Record<string, unknown>, flags: Flags): Promise<Result<unknown>> {
+  let result: Result<unknown>;
+  if (tool.confirm && args.confirm !== true) {
+    result = err("CONFIRM_REQUIRED", `'${tool.name}' is destructive; pass confirm=true (CLI: --yes) to proceed`);
+  } else {
+    try {
+      result = await tool.run(args, makeCtx(flags));
+    } catch (e) {
+      if (e instanceof ToolError) {
+        result = err(e.code, e.message, { retryable: e.retryable, details: e.details });
+      } else {
+        throw e;
+      }
+    }
+  }
+  audit(String(flags._surface ?? "cli"), tool.name, args, result);
+  return result;
+}
+
+function dryRunBaseline(
+  current: Result<unknown>,
+  graph: Graph,
+  issues: ReturnType<typeof validateGraph>,
+): Result<unknown> {
+  if (!current.ok) {
+    // Brand-new apps have no draft yet — graph is already validated; no baseline to diff.
+    if (
+      current.error.code === "NOT_FOUND" &&
+      /not.?initializ|need to be initialized/i.test(current.error.message)
+    ) {
+      return ok({ dry_run: true, diff: null, issues });
+    }
+    return current;
+  }
+  const fields = draftFields(current.data);
+  return ok({ dry_run: true, diff: fields.graph ? graphDiff(fields.graph, graph) : null, issues });
+}
+
+function audit(surface: string, tool: string, args: Record<string, unknown>, result: Result<unknown>): void {
+  try {
+    // Unit tests that forget DIFYWF_HOME must not append to ~/.difywf/audit.jsonl.
+    if (process.env.NODE_TEST_CONTEXT && !process.env.DIFYWF_HOME) return;
+    const dir = difywfHome();
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try {
+      fs.chmodSync(dir, 0o700);
+    } catch {
+      // ignore platforms that cannot chmod
+    }
+    const file = path.join(dir, "audit.jsonl");
+    if (!fs.existsSync(file)) fs.writeFileSync(file, "", { mode: 0o600 });
+    const entry = {
+      ts: new Date().toISOString(),
+      surface,
+      tool,
+      ok: result.ok,
+      code: result.ok ? null : result.error.code,
+      args: redactArgs(args),
+    };
+    fs.appendFileSync(file, JSON.stringify(entry) + "\n", { mode: 0o600 });
+    try {
+      fs.chmodSync(file, 0o600);
+    } catch {
+      // ignore platforms that cannot chmod
+    }
+  } catch {
+    // never break a tool call because audit logging failed
+  }
+}
+
+function graphDiff(a: Graph, b: Graph): unknown {
+  const an = new Map((a.nodes ?? []).map((n) => [n.id, n]));
+  const bn = new Map((b.nodes ?? []).map((n) => [n.id, n]));
+  const edgeKey = (e: GraphEdge) => `${e.source}->${e.target}:${e.sourceHandle ?? ""}`;
+  const ae = new Set((a.edges ?? []).map(edgeKey));
+  const be = new Set((b.edges ?? []).map(edgeKey));
+  return {
+    nodes: {
+      added: [...bn.keys()].filter((id) => !an.has(id)),
+      removed: [...an.keys()].filter((id) => !bn.has(id)),
+      changed: [...bn.keys()].filter((id) => an.has(id) && JSON.stringify(an.get(id)) !== JSON.stringify(bn.get(id))),
+    },
+    edges: { added: [...be].filter((x) => !ae.has(x)), removed: [...ae].filter((x) => !be.has(x)) },
+  };
+}
+
+function parseGraphArg(args: Record<string, unknown>): Graph {
+  if (args.graph && typeof args.graph === "object") return args.graph as Graph;
+  if (typeof args.graph_json === "string") {
+    try {
+      return JSON.parse(args.graph_json) as Graph;
+    } catch {
+      throw new ToolError("USAGE_ERROR", "graph_json is not valid JSON");
+    }
+  }
+  throw new ToolError("USAGE_ERROR", "pass graph (object) or graph_json (string)");
+}
+
+function defaultsToMap(data: unknown): Record<string, unknown> {
+  if (Array.isArray(data)) {
+    const map: Record<string, unknown> = {};
+    for (const item of data) {
+      if (item && typeof item === "object") {
+        const t = (item as Record<string, unknown>).type;
+        if (typeof t === "string") map[t] = item;
+      }
+    }
+    return map;
+  }
+  return data && typeof data === "object" ? (data as Record<string, unknown>) : {};
+}
+
+function buildKnowledgeDocumentBody(a: Record<string, unknown>): Record<string, unknown> {
+  if (a.body && typeof a.body === "object" && !Array.isArray(a.body)) {
+    return a.body as Record<string, unknown>;
+  }
+  const fileIds = a.file_ids;
+  if (Array.isArray(fileIds) && fileIds.length && fileIds.every((id) => typeof id === "string" && id)) {
+    const body: Record<string, unknown> = {
+      indexing_technique: str(a.indexing_technique) ?? "high_quality",
+      data_source: {
+        info_list: {
+          data_source_type: "upload_file",
+          file_info_list: { file_ids: fileIds },
+        },
+      },
+      process_rule: { mode: "automatic" },
+    };
+    if (str(a.name)) body.name = str(a.name);
+    return body;
+  }
+  throw new ToolError("USAGE_ERROR", "pass body (KnowledgeConfig) or file_ids from file.upload");
+}
+
+const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
+const nonEmptyStr = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+const num = (v: unknown): number | undefined => (typeof v === "number" ? v : typeof v === "string" && v && !Number.isNaN(Number(v)) ? Number(v) : undefined);
+const req = (args: Record<string, unknown>, key: string): string => {
+  const v = str(args[key]);
+  if (!v) throw new ToolError("USAGE_ERROR", `missing required argument '${key}'`);
+  return v;
+};
+const obj = (args: Record<string, unknown>, key: string): Record<string, unknown> => {
+  const v = args[key];
+  if (!v || typeof v !== "object" || Array.isArray(v)) throw new ToolError("USAGE_ERROR", `argument '${key}' must be an object`);
+  return v as Record<string, unknown>;
+};
+const pick = (args: Record<string, unknown>, keys: string[]): Record<string, unknown> => {
+  const out: Record<string, unknown> = {};
+  for (const k of keys) if (args[k] !== undefined) out[k] = args[k];
+  return out;
+};

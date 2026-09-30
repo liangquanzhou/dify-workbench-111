@@ -1,0 +1,9 @@
+Dify Workbench 1.11.1 adapter
+Based on alexjiaguo/dify-mcp, commit cfaa2abafaf8807c0914eff1bb7b9909e6599293.
+Original source is licensed under Apache License 2.0; see LICENSE.
+This distribution preserves the original project license and identifies modifications.
+
+Modifications (2026-09-30): added src/legacy Dify 1.11.1 profile, CLI dispatch,
+synthetic fixtures, safety/contract tests, mock demo, and adapter documentation.
+No company source code, business rules, account credentials, or case reports are included.
+The upstream project did not include a NOTICE file at the pinned commit.

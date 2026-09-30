@@ -1,0 +1,18 @@
+# Modified for Dify Workbench 1.11.1 on 2026-09-30; see NOTICE and MODIFICATIONS.md.
+.git
+.github
+.difywf
+.dify-workbench
+node_modules
+*.log
+Dockerfile*
+docs
+examples
+scripts
+test
+*.md
+.env*
+cookies.json
+*.cookie
+dify-workbench.json
+SOURCE-MANIFEST.sha256

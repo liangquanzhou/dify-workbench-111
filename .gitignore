@@ -1,0 +1,16 @@
+# Modified for Dify Workbench 1.11.1 on 2026-09-30; see NOTICE and MODIFICATIONS.md.
+node_modules/
+.difywf/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+cookies.json
+*.cookie
+.DS_Store
+.handoff/
+.sessions/
+.remember/
+.dify-workbench/
+dify-workbench.json
+*.log

@@ -1,0 +1,12 @@
+{
+  "profile": "dify-1.11.1",
+  "target": {
+    "base_url": "https://dify.example.invalid",
+    "workspace_id": "REPLACE_WITH_DEDICATED_TEST_WORKSPACE_UUID",
+    "app_id": "REPLACE_WITH_EXISTING_TEST_APP_UUID",
+    "mode": "workflow"
+  },
+  "dsl": "REPLACE_WITH_GENERATOR_FIXED_OUTPUT.yml",
+  "build": {"command": "node", "args": ["REPLACE_WITH_REVIEWED_GENERATOR_SCRIPT.js"], "cwd": "REPLACE_WITH_LOCAL_REPOSITORY_DIRECTORY", "timeout_ms": 120000},
+  "permissions": {"remote": false, "sync": false, "test": false, "publish": false, "build_command": false}
+}

@@ -1,0 +1,65 @@
+{
+  "name": "dify-workbench-111",
+  "version": "0.1.0",
+  "description": "Pinned dify-mcp adaptation: safety-gated Dify 1.11.1 DSL workflow CLI and MCP",
+  "type": "module",
+  "bin": {
+    "difywf": "bin/difywf.js"
+  },
+  "engines": {
+    "node": ">=23.6"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "smoke:mcp": "node scripts/legacy-mcp-smoke.mjs",
+    "smoke:mcp:http": "node scripts/mcp-smoke-http.mjs",
+    "test:legacy": "node --test test/legacy-*.test.ts",
+    "smoke:mcp:upstream": "DIFYWF_PROFILE=upstream node scripts/mcp-smoke.mjs",
+    "smoke:mcp:http:upstream": "DIFYWF_PROFILE=upstream node scripts/mcp-smoke-http.mjs",
+    "demo:legacy": "node scripts/legacy-demo.mjs",
+    "check": "npm run typecheck && npm test && npm run smoke:mcp && npm run demo:legacy"
+  },
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^26.6.1",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "yaml": "2.9.1"
+  },
+  "keywords": [
+    "dify",
+    "mcp",
+    "cli",
+    "workflow",
+    "ai-agent",
+    "claude-code",
+    "codex",
+    "gemini",
+    "cursor",
+    "cline",
+    "windsurf",
+    "zed",
+    "opencode",
+    "github-copilot",
+    "goose",
+    "trae",
+    "kilo-code",
+    "warp",
+    "crush",
+    "automation",
+    "llm"
+  ],
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/liangquanzhou/dify-workbench-111.git"
+  },
+  "bugs": {
+    "url": "https://github.com/liangquanzhou/dify-workbench-111/issues"
+  },
+  "homepage": "https://github.com/liangquanzhou/dify-workbench-111#readme",
+  "x-workbench-modified": "Modified for Dify Workbench 1.11.1 on 2026-09-30; see NOTICE and MODIFICATIONS.md"
+}

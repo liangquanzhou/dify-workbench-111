@@ -1,0 +1,55 @@
+version: 0.5.0
+kind: app
+dependencies: []
+app:
+  mode: workflow
+  name: Synthetic echo
+  description: Synthetic test fixture, no company rules or credentials
+  icon: 🤖
+  icon_background: '#FFEAD5'
+workflow:
+  environment_variables: []
+  conversation_variables: []
+  features:
+    opening_statement: ''
+    suggested_questions: []
+    suggested_questions_after_answer: {enabled: false}
+    speech_to_text: {enabled: false}
+    text_to_speech: {enabled: false, language: '', voice: ''}
+    retriever_resource: {enabled: true}
+    sensitive_word_avoidance: {enabled: false}
+    file_upload: {enabled: false}
+  graph:
+    viewport: {x: 0, y: 0, zoom: 1}
+    nodes:
+      - id: start
+        type: custom
+        position: {x: 0, y: 0}
+        data:
+          type: start
+          title: Start
+          variables:
+            - {variable: text, label: Text, type: text-input, required: true, max_length: 256}
+      - id: echo
+        type: custom
+        position: {x: 320, y: 0}
+        data:
+          type: code
+          title: Synthetic echo
+          code_language: python3
+          code: "def main(text: str) -> dict:\n    return {\"result\": \"echo: \" + text}\n"
+          variables:
+            - {variable: text, value_selector: [start, text]}
+          outputs:
+            result: {type: string, children: null}
+      - id: end
+        type: custom
+        position: {x: 640, y: 0}
+        data:
+          type: end
+          title: End
+          outputs:
+            - {variable: result, value_selector: [echo, result]}
+    edges:
+      - {id: start-echo, source: start, sourceHandle: source, target: echo, targetHandle: target, type: custom, data: {sourceType: start, targetType: code}}
+      - {id: echo-end, source: echo, sourceHandle: source, target: end, targetHandle: target, type: custom, data: {sourceType: code, targetType: end}}

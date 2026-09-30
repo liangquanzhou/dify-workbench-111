@@ -1,0 +1,46 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';import os from 'node:os';import path from 'node:path';
+import {execute} from '../src/legacy/workbench.ts';
+import {Console111} from '../src/legacy/transport.ts';
+import {parseDsl,normalizeDsl} from '../src/legacy/dsl.ts';
+import {digest,HIDDEN,redact} from '../src/legacy/util.ts';
+const graph=()=>({nodes:[{id:'s',data:{type:'start'}},{id:'c',data:{type:'code',code_language:'python3',code:'def main():\n    return {"text":"hello"}'}},{id:'e',data:{type:'end'}}],edges:[{id:'sc',source:'s',target:'c'},{id:'ce',source:'c',target:'e'}]});
+const dsl=()=>({version:'0.5.0',kind:'app',app:{mode:'workflow',name:'Synthetic echo'},dependencies:[],workflow:{graph:graph(),features:{},environment_variables:[],conversation_variables:[]}});
+function fixture(){
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'dify111-test-'));const f=path.join(root,'config.json'),yaml=path.join(root,'app.yml');fs.writeFileSync(yaml,JSON.stringify(dsl()));
+ fs.writeFileSync(f,JSON.stringify({profile:'dify-1.11.1',target:{base_url:'https://synthetic.test',workspace_id:'ws',app_id:'app',mode:'workflow'},dsl:'app.yml',permissions:{remote:true,sync:true,test:true,publish:true}}));
+ let draft:any={id:'draft-id',graph:graph(),features:{},environment_variables:[],conversation_variables:[],hash:'h0',updated_at:0};let writes:any[]=[];let n=0;let published:any;let runStatus='succeeded';let logStatus='succeeded';let uncertain=false;
+ const c:any={currentWorkspace:async()=>({id:'ws'}),getApp:async()=>({id:'app',mode:'workflow'}),getDraft:async()=>structuredClone(draft),syncDraft:async(_id:string,p:any)=>{writes.push(p);assert.equal(p.hash,draft.hash);draft={...p,id:'draft-id',hash:'h'+(++n),updated_at:n};return {result:'success',hash:draft.hash};},runDraft:async()=>({status:uncertain?'unknown':runStatus,workflow_run_id:'run',task_id:'task',events:[]}),getRun:async()=>({id:'run',graph:draft.graph,status:logStatus,error:logStatus==='failed'?'synthetic failure':null}),nodeExecutions:async()=>({data:[{node_id:'c',status:logStatus,error:logStatus==='failed'?'synthetic failure':null}]}),publish:async()=>{published=structuredClone(draft);return {result:'success'};},getPublished:async()=>published};
+ return {root,f,yaml,c,run:(a:string,args:any={})=>execute(a,args,{configFile:f,client:c as Console111}),draft:()=>draft,writeDsl:(fn:(d:any)=>void)=>{const d=dsl();fn(d);fs.writeFileSync(yaml,JSON.stringify(d));},writes,changeRemote:()=>{draft.features={remote:true};draft.hash='changed';},setRun:(s:string)=>{runStatus=s;logStatus=s;},contradict:()=>{logStatus='failed';},unknown:()=>{uncertain=true;},state:()=>JSON.parse(fs.readFileSync(path.join(root,'.dify-workbench/state.json'),'utf8')),published:()=>published};
+}
+test('111 golden path builds -> diff -> sync twice SAME APP -> test/logs; no auto publish',async()=>{
+ const f=fixture();assert.equal((await f.run('build')).ok,true);await f.run('snapshot');
+ for(const word of ['first','second']){f.writeDsl(d=>d.workflow.graph.nodes[1].data.code=word);const diff=await f.run('diff');const sync=await f.run('sync',{expected_digest:diff.desired_digest});assert.equal(sync.app_id,'app');assert.equal(sync.readback_verified,true);const r=await f.run('test',{expected_digest:sync.draft_digest,inputs:{synthetic:true}});assert.equal(r.qualifies_for_publish,true);assert.equal(r.workflow_run_id,'run');assert.equal(r.logs.nodes[0].node_id,'c');}
+ assert.equal(f.writes.length,2);assert.equal(f.published(),undefined);
+ const before=f.state();assert.equal(before.test_receipt.status,'succeeded');await assert.rejects(f.run('publish',{expected_digest:before.baseline.digest}),/confirm-publish/);
+ const p=await f.run('publish',{expected_digest:before.baseline.digest,confirm_publish:before.baseline.digest});assert.equal(p.readback_verified,true);assert.equal(f.state().test_receipt,undefined);
+});
+test('111 stale baseline cannot be silently replaced by fresh server hash',async()=>{const f=fixture();await f.run('snapshot');f.changeRemote();await assert.rejects(f.run('diff'),(e:any)=>e.code==='DRAFT_CONFLICT');assert.equal(f.writes.length,0);});
+test('111 failure and log contradiction never qualify for publish',async()=>{
+ for(const contradict of [false,true]){const f=fixture();await f.run('snapshot');const expected=f.state().baseline.digest;if(contradict)f.contradict();else f.setRun('failed');const r=await f.run('test',{expected_digest:expected});assert.equal(r.ok,false);assert.equal(r.qualifies_for_publish,false);assert.equal(f.state().test_receipt,undefined);}
+});
+test('111 unknown run stays unresolved, rejects blind retry',async()=>{const f=fixture();await f.run('snapshot');f.unknown();const expected=f.state().baseline.digest;const r=await f.run('test',{expected_digest:expected});assert.equal(r.status,'unknown');assert.equal(f.state().pending_mutation.workflow_run_id,'run');await assert.rejects(f.run('test',{expected_digest:expected}),(e:any)=>e.code==='MUTATION_UNRESOLVED');});
+test('111 version, aliases, duplicate YAML fields rejected',()=>{assert.throws(()=>parseDsl('kind: app\nkind: app\nversion: 0.5.0'));assert.throws(()=>parseDsl(JSON.stringify({...dsl(),version:'0.7.0'})));assert.throws(()=>parseDsl('x: &anchor {a: 1}\ny: *anchor'));});
+test('111 secrets preserved when blank or omitted, new secrets blocked',()=>{
+ const d=dsl() as any;const remote={...d.workflow,environment_variables:[{id:'sec',name:'KEY',value_type:'secret',value:HIDDEN}]};
+ let n=normalizeDsl(d,remote,'workflow');assert.equal(n.payload.environment_variables[0].value,HIDDEN);
+ d.workflow.environment_variables=[{id:'sec',name:'KEY',value_type:'secret',value:''}];n=normalizeDsl(d,remote,'workflow');assert.equal(n.payload.environment_variables[0].value,HIDDEN);
+ d.workflow.environment_variables[0].id='new';assert.throws(()=>normalizeDsl(d,remote,'workflow'),/New secrets/);
+});
+test('111 encrypted dataset refs blocked, explicit UUID mapping preserved',()=>{const d=dsl() as any;d.workflow.graph.nodes[1].data={type:'knowledge-retrieval',dataset_ids:['encrypted']};assert.throws(()=>normalizeDsl(d,d.workflow,'workflow'),/Encrypted/);const id='11111111-1111-4111-8111-111111111111';const n=normalizeDsl(d,d.workflow,'workflow',{encrypted:id});assert.deepEqual(n.datasetIds,[id]);});
+test('111 exported tool credential omission preserves existing binding',()=>{const d=dsl() as any;d.workflow.graph.nodes[1].data={type:'tool',provider_id:'provider',provider_type:'builtin',tool_name:'synthetic'};const remote=structuredClone(d.workflow);remote.graph.nodes[1].data.credential_id='existing-binding';const n=normalizeDsl(d,remote,'workflow');assert.equal(n.payload.graph.nodes[1].data.credential_id,'existing-binding');d.workflow.graph.nodes[1].data.tool_name='changed';assert.throws(()=>normalizeDsl(d,remote,'workflow'),/same provider/);});
+test('111 nested iteration graph accepted without deleting container semantics',()=>{const d=dsl() as any;d.workflow.graph.nodes.push({id:'iter',data:{type:'iteration',start_node_id:'istart',iterator_selector:['s','items'],output_selector:['c','text']}},{id:'istart',parentId:'iter',data:{type:'iteration-start'}});assert.equal(parseDsl(JSON.stringify(d)).workflow.graph.nodes.length,5);});
+test('111 redaction covers cookie values and secret variable values',()=>{const out=redact({error:'secret-cookie',nested:{'__Host-access_token':'x'},environment_variables:[{value_type:'secret',value:'hidden'}]},['secret-cookie']);assert.equal(out.error,'[REDACTED]');assert.equal(out.nested['__Host-access_token'],'[REDACTED]');assert.equal(out.environment_variables[0].value,'[REDACTED]');});
+test('111 permissions default off; generator is explicit and never arbitrary tool argument',async()=>{const f=fixture();const config=JSON.parse(fs.readFileSync(f.f,'utf8'));delete config.permissions;config.build={command:process.execPath,args:['-e','throw new Error("must not run")']};fs.writeFileSync(f.f,JSON.stringify(config));await assert.rejects(f.run('snapshot'),(e:any)=>e.code==='REMOTE_DISABLED');await assert.rejects(f.run('build'),(e:any)=>e.code==='BUILD_DISABLED');});
+import {execFileSync} from 'node:child_process';
+test('111 bin preserves upstream commands for separate, equals, and environment profile forms',()=>{
+ for(const [args,env] of [[['--profile','upstream','--version'],{}],[['--version','--profile=upstream'],{}],[['--version'],{DIFYWF_PROFILE:'upstream'}]] as const){const out=execFileSync(process.execPath,['bin/difywf.js',...args],{encoding:'utf8',env:{...process.env,...env}});assert.match(out,/0.3.0/);}
+});
+test('111 unknown variable selectors fail rather than losing semantics',()=>{const d=dsl() as any;d.workflow.environment_variables=[{id:'x',name:'x',value_type:'string',value:'v',selector:['custom','x']}];assert.throws(()=>normalizeDsl(d,{...d.workflow,environment_variables:[]},'workflow'),(e:any)=>e.code==='UNSUPPORTED_SELECTOR');});
+test('111 custom YAML tags and unsafe numeric precision are rejected',()=>{assert.throws(()=>parseDsl('!custom '+JSON.stringify(dsl())));const d=dsl() as any;d.workflow.features.number=9007199254740992;assert.throws(()=>parseDsl(JSON.stringify(d)),(e:any)=>e.code==='UNSAFE_NUMBER');});

@@ -1,0 +1,14 @@
+{
+  "profile": "dify-1.11.1",
+  "target": {
+    "base_url": "https://dify.example.invalid",
+    "workspace_id": "REPLACE_WITH_DEDICATED_TEST_WORKSPACE_UUID",
+    "app_id": "REPLACE_WITH_EXISTING_TEST_APP_UUID",
+    "mode": "workflow"
+  },
+  "dsl": "echo.yml",
+  "state_file": ".dify-workbench/state.json",
+  "permissions": {"remote": false, "sync": false, "test": false, "publish": false, "build_command": false},
+  "dataset_bindings": {},
+  "timeout_ms": 300000
+}

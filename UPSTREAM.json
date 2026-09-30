@@ -1,0 +1,28 @@
+{
+  "adapter": {
+    "name": "dify-workbench-111",
+    "version": "0.1.0",
+    "date": "2026-09-30",
+    "published": false,
+    "publication_target": "https://github.com/liangquanzhou/dify-workbench-111",
+    "publication_status_at_build": "prepared, not published by this build"
+  },
+  "source": {
+    "repository": "https://github.com/alexjiaguo/dify-mcp",
+    "commit": "cfaa2abafaf8807c0914eff1bb7b9909e6599293",
+    "version": "0.3.0",
+    "license": "Apache-2.0"
+  },
+  "target_contract": {
+    "repository": "https://github.com/langgenius/dify",
+    "version": "1.11.1",
+    "commit": "2058186f22b4e4d4e155f380c130f4e8f21622fa",
+    "dsl_version": "0.5.0"
+  },
+  "verification": {
+    "automated_tests": 169,
+    "real_dify": false,
+    "company_environment": false,
+    "docker_build": false
+  }
+}
