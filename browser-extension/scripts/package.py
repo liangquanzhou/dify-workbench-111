@@ -24,7 +24,7 @@ def make_archive(path, entries):
 runtime_names = ['manifest.json','background.js','content.js','reader.js','dock.css','LICENSE','THIRD_PARTY_NOTICES.md','README.md','INSTALL.zh-CN.md']
 assert {p.name for p in (dist/'extension').iterdir()} == set(runtime_names), 'Unexpected runtime file'
 extension_entries = [(dist/'extension'/name, name) for name in runtime_names]
-source_names = ['README.md','README.zh-CN.md','THIRD_PARTY_NOTICES.md','LICENSE','manifest.json','package.json','package-lock.json','tsconfig.json','upstream-lock.json','INSTALL-0.4.0.zh-CN.md','.gitignore','docs/REAL-E2E-0.4.0.md']
+source_names = ['README.md','README.zh-CN.md','THIRD_PARTY_NOTICES.md','LICENSE','manifest.json','package.json','package-lock.json','tsconfig.json','upstream-lock.json','INSTALL-0.4.1.zh-CN.md','.gitignore','docs/REAL-E2E-0.4.0.md','docs/REAL-E2E-0.4.1.md']
 for folder in ['src','scripts','examples','packaging']:
     source_names += [p.relative_to(root).as_posix() for p in (root/folder).rglob('*') if p.is_file() and '__pycache__' not in p.parts]
 source_names += [p.relative_to(root).as_posix() for p in (root/'tests').iterdir() if p.is_file()]
@@ -32,7 +32,7 @@ source_names += [p.relative_to(root).as_posix() for p in (root/'tests/fixtures/s
 source_entries = [(root/name, 'dmn-browser-preview/'+name) for name in source_names]
 source_entries += [(p, 'dmn-browser-preview/dist/extension/'+name) for p,name in extension_entries]
 reader_entries = [(root/'examples'/name,name) for name in ['reader-latest.yml','reader-version.yml','reader-connections.example.json']]
-reader_entries += [(root/'INSTALL-0.4.0.zh-CN.md','INSTALL.zh-CN.md'),(root/'LICENSE','LICENSE')]
+reader_entries += [(root/'INSTALL-0.4.1.zh-CN.md','INSTALL.zh-CN.md'),(root/'LICENSE','LICENSE')]
 paths = [dist/f'dmn-browser-preview-{version}.zip',dist/f'dmn-browser-preview-{version}-source.zip',dist/f'dmn-reader-workflows-{version}.zip']
 for path, entries in zip(paths,[extension_entries,source_entries,reader_entries]):
     make_archive(path, entries)

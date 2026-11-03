@@ -83,6 +83,13 @@
       if (ref.status !== "ready") return { ...base, ...ref };
       return { ...base, ...bundle, auxiliary: ref.raw, format: "brian-decision" };
     }
+    if (provider === BRIAN_JSON_PROVIDER && tool === "route_table_store") {
+      const fields = ["op", "table", "version"].map((name) => [name, readParameter(data, name, "tool_parameters")]);
+      const storeNode = {};
+      for (const [name, value] of fields) if (value.status === "ready" && value.raw.length <= 1024) storeNode[name] = value.raw.trim();
+      return { ...base, status: "dynamic", storeNode, message: `\u8FD9\u662F\u8DEF\u7531\u8868\u5B58\u53D6\u8282\u70B9\uFF1B\u53C2\u6570\u4E2D\u7684\u53D8\u91CF\u8981\u5230\u8FD0\u884C\u65F6\u624D\u6709\u503C\u3002\u53EF\u8BFB\u53D6\u6B64\u8282\u70B9\u5DF2\u6709\u7684\u4E0A\u6B21\u8FD0\u884C\u8BB0\u5F55\uFF0C\u6216\u5BFC\u5165\u5DF2\u4FDD\u5B58\u8868\u7684 JSON\u3002\u9884\u89C8\u4E0D\u4F1A\u6267\u884C\u8282\u70B9\uFF0C\u4E5F\u4E0D\u4F1A\u4FDD\u5B58\u8868\u3002
+${fields.map(([name, value]) => `${name}: ${value.status === "ready" ? value.raw : value.message}`).join("\n")}` };
+    }
     if (provider === BRIAN_JSON_PROVIDER && tool === "evaluate_stored_table") {
       const table = readParameter(data, "table", "tool_parameters");
       const format = readParameter(data, "format", "tool_configurations");

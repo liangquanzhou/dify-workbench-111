@@ -7,7 +7,8 @@ export const STOP_EVENT = 'dmn-preview:stop:v1'
 export const REFRESH_EVENT = 'dmn-preview:refresh:v1'
 export const MAX_TABLE_CHARS = 512 * 1024
 export type StoredReference = { table: string; format: string; version?: string; digest?: string }
-export type Snapshot = { status: 'ready' | 'empty' | 'dynamic' | 'unsupported' | 'idle' | 'error'; nodeId?: string; title?: string; raw?: string; message?: string; format?: 'brian-json' | 'brian-decision' | 'dmn-xml'; auxiliary?: string; storage?: StoredReference }
+export type StoreNode = { table?: string; version?: string; op?: string }
+export type Snapshot = { status: 'ready' | 'empty' | 'dynamic' | 'unsupported' | 'idle' | 'error'; nodeId?: string; title?: string; raw?: string; message?: string; format?: 'brian-json' | 'brian-decision' | 'dmn-xml'; auxiliary?: string; storage?: StoredReference; storeNode?: StoreNode }
 export function ownValue(object: unknown, name: string): unknown {
   if (!object || typeof object !== 'object') return undefined
   return Object.getOwnPropertyDescriptor(object, name)?.value
@@ -84,6 +85,12 @@ function extractBrian(data: unknown, nodeId: string, provider: unknown): Snapsho
     if (bundle.status !== 'ready') return { ...base, ...bundle }
     if (ref.status !== 'ready') return { ...base, ...ref }
     return { ...base, ...bundle, auxiliary: ref.raw, format: 'brian-decision' }
+  }
+  if (provider === BRIAN_JSON_PROVIDER && tool === 'route_table_store') {
+    const fields = ['op', 'table', 'version'].map(name => [name, readParameter(data, name, 'tool_parameters')] as const)
+    const storeNode: StoreNode = {}
+    for (const [name, value] of fields) if (value.status === 'ready' && value.raw!.length <= 1024) storeNode[name as keyof StoreNode] = value.raw!.trim()
+    return { ...base, status: 'dynamic', storeNode, message: `这是路由表存取节点；参数中的变量要到运行时才有值。可读取此节点已有的上次运行记录，或导入已保存表的 JSON。预览不会执行节点，也不会保存表。\n${fields.map(([name, value]) => `${name}: ${value.status === 'ready' ? value.raw : value.message}`).join('\n')}` }
   }
   if (provider === BRIAN_JSON_PROVIDER && tool === 'evaluate_stored_table') {
     const table = readParameter(data, 'table', 'tool_parameters')

@@ -2,6 +2,7 @@ import { parseTable, literal, outputValue } from './model'
 import type { Snapshot, StoredReference } from './binding'
 import { parseBrian } from './brian'
 import { parseXml } from './xml'
+import { previewStoreResult, readStoreLastRun } from './store-node'
 import { importStored, MAX_IMPORT_BYTES } from './stored'
 import type { Matrix } from './model'
 import type { StoredPreview } from './stored'
@@ -31,6 +32,7 @@ export function renderSnapshot(container: HTMLElement, snapshot: Snapshot, page 
     message.setAttribute('role', snapshot.status === 'error' ? 'alert' : 'status')
     container.append(message)
     if (snapshot.storage) importControls(container, snapshot.storage)
+    if (snapshot.storeNode && snapshot.nodeId) storeControls(container, snapshot)
     return
   }
   const parsed = snapshot.format === 'dmn-xml' ? parseXml(snapshot, document)
@@ -146,23 +148,6 @@ function importControls(container: HTMLElement, ref: StoredReference) {
     element(document, 'div', '维护者审核的查询连接（可选）', 'dmnp-footnote'), config, enable)
   container.append(controls, refresh, disconnect, output)
   let attempt = 0
-  function show(preview: StoredPreview) {
-    const lines = preview.provenance.split('\n')
-    output.append(element(document, 'div', lines.filter(line => line.startsWith('表 ') || line.startsWith('content_sha256')).join('\n'), 'dmnp-meta'))
-    const provenance = document.createElement('details')
-    provenance.append(element(document, 'summary', '来源、运行记录与摘要校验（展开）'), element(document, 'div', preview.provenance, 'dmnp-status'))
-    output.append(provenance)
-    const select = document.createElement('select')
-    select.setAttribute('aria-label', '选择决策集模型')
-    preview.models.forEach((m, i) => { const option = document.createElement('option'); option.value = String(i); option.textContent = `${m.key} · ${m.matrix.table.id}`; select.append(option) })
-    if (preview.models.length > 1) output.append(select)
-    const matrix = element(document, 'div'); output.append(matrix)
-    const render = () => renderMatrix(matrix, preview.models[Number(select.value || 0)].matrix, true)
-    select.addEventListener('change', render); render()
-    const details = document.createElement('details')
-    details.append(element(document, 'summary', '完整导入文档（含声明、字典与模板）'), element(document, 'pre', JSON.stringify(preview.document, null, 2)))
-    output.append(details)
-  }
   async function load(source: 'local' | 'reader', task: (signal: AbortSignal) => Promise<StoredPreview>) {
     cancelPreview(container)
     const controller = new AbortController(); pendingReads.set(container, controller)
@@ -179,7 +164,7 @@ function importControls(container: HTMLElement, ref: StoredReference) {
       container.dataset.status = source === 'local' ? 'imported' : 'queried'
       if (referenceMessage) referenceMessage.textContent = source === 'local' ? '节点仅含存储引用。以下展示已导入快照；未查询线上当前版本。' : '节点仅含存储引用。以下表体来自已授权查询应用，已核对节点版本和摘要约束。'
       controls.open = false
-      show(preview)
+      showStored(output, preview)
     } catch (e) {
       if (!active()) return
       container.dataset.status = 'error'; output.replaceChildren()
@@ -209,4 +194,63 @@ function importControls(container: HTMLElement, ref: StoredReference) {
     if (referenceMessage) referenceMessage.textContent = originalMessage
   })
   if (readerConnected(document.location.href)) void query()
+}
+
+function showStored(output: HTMLElement, preview: StoredPreview) {
+    const document = output.ownerDocument
+    const lines = preview.provenance.split('\n')
+    output.append(element(document, 'div', lines.filter(line => line.startsWith('表 ') || line.startsWith('content_sha256')).join('\n'), 'dmnp-meta'))
+    const provenance = document.createElement('details')
+    provenance.append(element(document, 'summary', '来源、运行记录与摘要校验（展开）'), element(document, 'div', preview.provenance, 'dmnp-status'))
+    output.append(provenance)
+    const select = document.createElement('select')
+    select.setAttribute('aria-label', '选择决策集模型')
+    preview.models.forEach((m, i) => { const option = document.createElement('option'); option.value = String(i); option.textContent = `${m.key} · ${m.matrix.table.id}`; select.append(option) })
+    if (preview.models.length > 1) output.append(select)
+    const matrix = element(document, 'div'); output.append(matrix)
+    const render = () => renderMatrix(matrix, preview.models[Number(select.value || 0)].matrix, true)
+    select.addEventListener('change', render); render()
+    const details = document.createElement('details')
+    details.append(element(document, 'summary', '完整导入文档（含声明、字典与模板）'), element(document, 'pre', JSON.stringify(preview.document, null, 2)))
+    output.append(details)
+  }
+
+function storeControls(container: HTMLElement, snapshot: Snapshot) {
+  const document = container.ownerDocument, generation = renderGenerations.get(container)
+  const activationUrl = document.location.href
+  const read = element(document, 'button', '读取上次运行（只读）') as HTMLButtonElement
+  const input = document.createElement('input')
+  input.type = 'file'; input.accept = '.json,application/json'; input.setAttribute('aria-label', '导入存取结果 result_json 或已保存表 JSON')
+  const output = element(document, 'div')
+  container.append(element(document, 'p', '下方只显示已有历史快照，不代表当前存储最新版。没有完整表体时不会生成表格。', 'dmnp-footnote'), read, input, output)
+  let attempt = 0
+  async function load(task: (signal: AbortSignal) => Promise<StoredPreview>) {
+    cancelPreview(container)
+    const controller = new AbortController(); pendingReads.set(container, controller)
+    const current = ++attempt, timer = setTimeout(() => controller.abort(), 30000)
+    const active = () => renderGenerations.get(container) === generation && attempt === current && container.isConnected && document.location.href === activationUrl
+    output.replaceChildren(element(document, 'div', '正在读取并核对历史表体、版本和摘要…', 'dmnp-status'))
+    container.dataset.status = 'dynamic'
+    try {
+      const preview = await task(controller.signal)
+      if (!active()) return
+      if (controller.signal.aborted) throw Error('读取已取消或超时')
+      output.replaceChildren(element(document, 'div', '历史快照 · 未确认当前存储版本', 'dmnp-status'))
+      container.dataset.status = 'historical'
+      showStored(output, preview)
+    } catch (e) {
+      if (!active()) return
+      container.dataset.status = 'error'
+      output.replaceChildren(element(document, 'div', controller.signal.aborted ? '读取已取消或超时；未显示旧表。' : e instanceof Error ? e.message : '读取失败', 'dmnp-status'))
+    } finally { clearTimeout(timer); if (pendingReads.get(container) === controller) pendingReads.delete(container) }
+  }
+  read.addEventListener('click', () => load(signal => {
+    const observed = document.defaultView?.performance.getEntriesByType?.('resource').map(entry => entry.name) || []
+    return readStoreLastRun(snapshot.storeNode!, activationUrl, snapshot.nodeId!, signal, observed)
+  }))
+  input.addEventListener('change', () => load(async () => {
+    const file = input.files?.[0]
+    if (!file || file.size > MAX_IMPORT_BYTES) throw Error('请选择不超过 832 KiB 的 JSON 文件')
+    return previewStoreResult(await file.text(), snapshot.storeNode!, file.name)
+  }))
 }

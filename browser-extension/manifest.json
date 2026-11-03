@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DMN Matrix Preview for Dify 1.11.1",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Read-only DMN preview for legacy and hu8627 JSON/XML decision tools. Activate on this tab only.",
   "minimum_chrome_version": "102",
   "permissions": [

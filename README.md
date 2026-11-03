@@ -1,5 +1,5 @@
 <!-- Modified for Dify Workbench 1.11.1 on 2026-09-30; see NOTICE and MODIFICATIONS.md. -->
-# Dify Workbench 1.11.1 · CLI v0.1.0 + 浏览器预览 v0.4.0
+# Dify Workbench 1.11.1 · CLI v0.1.0 + 浏览器预览 v0.4.1
 
 一个入口接起“本地生成 DSL → 比较 → 更新同一个应用草稿 → 测试 → 查看节点错误 → 修改复跑”。CLI 和 MCP 调用同一套安全状态机。
 
@@ -7,11 +7,11 @@
 
 ## 浏览器内查看 Brian DMN 表格
 
-下载 [浏览器预览 0.4.0](https://github.com/liangquanzhou/dify-workbench-111/releases/tag/browser-v0.4.0) 的扩展 ZIP，按组织允许的方式加载，打开 Dify 工作流后点击扩展图标和 DMN 节点。
+下载 [浏览器预览 0.4.1](https://github.com/liangquanzhou/dify-workbench-111/releases/tag/browser-v0.4.1) 的扩展 ZIP，按组织允许的方式加载，打开 Dify 工作流后点击扩展图标和 DMN 节点。
 
 - 本次仅新增配套浏览器扩展，不提供自制 Dify DMN 插件；继续使用已安装的 Brian 插件。
 - 内联 JSON、definition bundle、XML 可直接展示。存储表需导入已授权的表 JSON，或配置附件中的固定只读查询工作流。查询模板是普通工作流，不是新的 Dify 插件。
-- 查看 [浏览器安装步骤](browser-extension/INSTALL-0.4.0.zh-CN.md)、[支持范围](browser-extension/README.md)、[真实隔离验收](browser-extension/docs/REAL-E2E-0.4.0.md)。
+- 查看 [浏览器安装步骤](browser-extension/INSTALL-0.4.1.zh-CN.md)、[支持范围](browser-extension/README.md)、[真实隔离验收](browser-extension/docs/REAL-E2E-0.4.0.md)。
 - 浏览器模块与 CLI/MCP 独立：不共享 Console Cookie、状态文件或远程写入权限。浏览器目录保留 MIT 许可，CLI/MCP 保留 Apache-2.0。
 - `npm run check` 同时检查既有 Workbench 和浏览器模块（后者安装独立锁定开发依赖）；`npm run package:browser` 打包已构建的浏览器附件。CI 沿用既有工作流。
 

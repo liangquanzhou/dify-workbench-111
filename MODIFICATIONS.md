@@ -23,3 +23,7 @@ Changes introduce the Dify 1.11.1 default profile, profile dispatch, synthetic s
 ## 2026-11-03: optional Brian DMN browser preview
 
 Added an independently built MIT-licensed browser-extension directory, scoped read-workflow templates, original synthetic regressions and upstream compatibility checker. Root README and npm check/package scripts expose the optional module. Existing CLI/MCP source, safety gates, dependency versions and workflow actions remain unchanged. The browser runtime is reused from reviewed commit 4740592f1129e3e436b9efbc72ba71f9bb7b8d81 of liangquanzhou/dify-dmn-plugin; no custom Dify plugin package is included. Browser notices retain its original source attribution.
+
+## 2026-11-03: route_table_store browser preview fix
+
+Browser 0.4.1 recognizes Brian route_table_store nodes and displays explicitly requested historical results through same-origin GET last-run or local saved JSON import. It never executes the maintenance node. Saved version, table and digest validation remain mandatory; custom endpoints require an observed exact current-app/current-node route. No CLI/MCP or company configuration changes.

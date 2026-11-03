@@ -42,6 +42,7 @@ if (existing) {
     if (snapshot.auxiliary !== undefined && (typeof snapshot.auxiliary !== 'string' || snapshot.auxiliary.length > MAX_TABLE_CHARS)) return
     if (snapshot.format !== undefined && !['brian-json', 'brian-decision', 'dmn-xml'].includes(snapshot.format)) return
     if (snapshot.storage !== undefined && (!snapshot.storage || typeof snapshot.storage !== 'object' || typeof snapshot.storage.table !== 'string' || typeof snapshot.storage.format !== 'string' || Object.entries(snapshot.storage).some(([k, v]) => !['table', 'format', 'version', 'digest'].includes(k) || typeof v !== 'string' || v.length > 1024))) return
+    if (snapshot.storeNode !== undefined && (!snapshot.storeNode || typeof snapshot.storeNode !== 'object' || Object.entries(snapshot.storeNode).some(([k, v]) => !['table', 'version', 'op'].includes(k) || typeof v !== 'string' || v.length > 1024))) return
     if (snapshot.nodeId !== undefined && typeof snapshot.nodeId !== 'string') return
     if (snapshot.title !== undefined && typeof snapshot.title !== 'string') return
     if (snapshot.message !== undefined && typeof snapshot.message !== 'string') return

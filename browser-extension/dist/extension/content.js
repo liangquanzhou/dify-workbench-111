@@ -577,18 +577,106 @@ ${ref.version || ref.digest ? "\u5DF2\u6838\u5BF9\u8282\u70B9\u7248\u672C/\u6458
     return { models, document: doc, provenance };
   }
 
+  // src/store-node.ts
+  var formats = {
+    "dmn-json.decision-table/v1": "decision-table/v1",
+    "dmn-json.decision-set/v1": "decision-set/v1",
+    "dmn-json.route-table/v1": "admission-routing-table/v1",
+    "dmn-json.route-table/v2": "routing-table/v2",
+    "dmn-json.route-table/v3": "routing-table/v3",
+    "dmn-json.supplement-requirements/v1": "supplement-requirements/v1",
+    "dmn-json.supplement-requirements/v2": "supplement-requirements/v2",
+    "dmn-json.resource-targets/v1": "resource-targets/v1"
+  };
+  function need2(ok, message) {
+    if (!ok) throw Error(message);
+  }
+  async function previewStoreResult(raw, ref, label) {
+    need2(new TextEncoder().encode(raw).length <= MAX_IMPORT_BYTES, "\u6587\u4EF6\u8D85\u8FC7 832 KiB \u5BFC\u5165\u4E0A\u9650");
+    let value = parseJson(raw);
+    need2(isRecord(value), "\u8868\u6587\u4EF6\u5FC5\u987B\u4E3A JSON \u5BF9\u8C61");
+    if ("status_code" in value) {
+      need2(value.status_code === 200 && isRecord(value.result), "\u5B58\u53D6\u7ED3\u679C\u672A\u6210\u529F");
+      value = value.result;
+    }
+    const doc = isRecord(value) && "doc" in value ? value.doc : value;
+    need2(isRecord(doc) && typeof doc.table === "string" && typeof doc.schema === "string", "\u7ED3\u679C\u6CA1\u6709\u5B8C\u6574\u5DF2\u4FDD\u5B58\u8868\uFF1Bhistory \u5217\u8868\u3001\u6C42\u503C\u7ED3\u679C\u548C\u672A\u4FDD\u5B58\u8349\u7A3F\u4E0D\u80FD\u4EE3\u66FF\u8868\u4F53");
+    const format = formats[doc.schema];
+    need2(format, "\u5C1A\u4E0D\u652F\u6301\u8FD9\u4E2A\u5B58\u50A8\u8868\u683C\u5F0F");
+    const preview = await importStored(raw, { table: ref.table || doc.table, format, version: ref.op === "version" ? ref.version : void 0 }, label);
+    preview.provenance += "\n\u5B58\u53D6\u8282\u70B9\u5FEB\u7167\uFF1A\u53D8\u91CF\u8F93\u5165\u672A\u4E0E\u5F53\u524D\u8FD0\u884C\u7ED1\u5B9A\uFF1B\u4E0D\u662F\u5F53\u524D\u5B58\u50A8\u7248\u672C\u7684\u8BC1\u660E\u3002";
+    return preview;
+  }
+  function lastRunUrl(pageUrl, nodeId, observedUrls = []) {
+    const page = new URL(pageUrl);
+    need2(isWorkflowEditorLocation(page) && (page.protocol === "https:" || page.protocol === "http:" && ["127.0.0.1", "localhost"].includes(page.hostname)), "\u8BF7\u5728\u53D7\u652F\u6301\u7684\u5B89\u5168 Workflow \u9875\u9762\u8BFB\u53D6");
+    const match = page.pathname.match(/\/(?:v2\/)?app\/([0-9a-f-]{36})(?:\/workflow)?\/?$/i);
+    need2(match && /^[a-zA-Z0-9_-]{1,100}$/.test(nodeId), "\u5E94\u7528\u6216\u8282\u70B9\u6807\u8BC6\u4E0D\u652F\u6301");
+    const suffix = `/apps/${match[1]}/workflows/draft/nodes/${nodeId}/last-run`;
+    if (page.pathname.startsWith("/app/")) return page.origin + "/console/api" + suffix;
+    const candidates = new Set(observedUrls.filter((raw) => {
+      try {
+        const url = new URL(raw);
+        const prefix = url.pathname.slice(0, -suffix.length);
+        return url.origin === page.origin && !url.username && !url.password && !url.search && !url.hash && url.pathname.endsWith(suffix) && /^\/(?:[a-zA-Z0-9_-]+\/)*api$/.test(prefix);
+      } catch {
+        return false;
+      }
+    }));
+    need2(candidates.size === 1, "\u6B64\u5B9A\u5236\u9875\u9762\u7684\u53EA\u8BFB\u63A5\u53E3\u5C1A\u672A\u786E\u8BA4\u3002\u8BF7\u5148\u6253\u5F00\u8BE5\u8282\u70B9\u7684\u300C\u4E0A\u6B21\u8FD0\u884C\u300D\uFF0C\u518D\u70B9\u51FB\u8BFB\u53D6\uFF1B\u4E5F\u53EF\u5BFC\u5165\u5176\u4E2D\u7684 result_json\u3002\u4E0D\u8981\u4E3A\u9884\u89C8\u8FD0\u884C\u4FDD\u5B58\u8282\u70B9\u3002");
+    return [...candidates][0];
+  }
+  async function readStoreLastRun(ref, pageUrl, nodeId, signal, observedUrls = [], request = fetch) {
+    const url = lastRunUrl(pageUrl, nodeId, observedUrls);
+    const response = await request(url, { method: "GET", credentials: "same-origin", redirect: "error", cache: "no-store", signal, headers: { Accept: "application/json" } });
+    need2(response.ok, `\u8BFB\u53D6\u4E0A\u6B21\u8FD0\u884C\u5931\u8D25\uFF08HTTP ${response.status}\uFF09\u3002\u8BF7\u786E\u8BA4\u5DF2\u6709\u8FD0\u884C\u8BB0\u5F55\u548C\u67E5\u770B\u6743\u9650\uFF1B\u4E0D\u4F1A\u89E6\u53D1\u8FD0\u884C\u3002`);
+    need2(!response.redirected && (!response.url || response.url === url), "\u53EA\u8BFB\u54CD\u5E94\u5730\u5740\u5DF2\u53D8\u5316");
+    need2(response.body, "\u53EA\u8BFB\u54CD\u5E94\u4E3A\u7A7A");
+    const reader = response.body.getReader(), chunks = [];
+    let bytes = 0;
+    try {
+      while (true) {
+        const part = await reader.read();
+        if (part.done) break;
+        bytes += part.value.byteLength;
+        need2(bytes <= 8 * 1024 * 1024, "\u8FD0\u884C\u8BB0\u5F55\u8D85\u8FC7 8 MiB \u9650\u5236");
+        need2(!signal.aborted, "\u8BFB\u53D6\u5DF2\u53D6\u6D88");
+        chunks.push(part.value);
+      }
+    } finally {
+      await reader.cancel();
+      reader.releaseLock();
+    }
+    const decoder = new TextDecoder(), raw = chunks.map((c) => decoder.decode(c, { stream: true })).join("") + decoder.decode();
+    const run = JSON.parse(raw);
+    need2(isRecord(run) && run.node_id === nodeId && run.node_type === "tool" && run.status === "succeeded" && typeof run.id === "string", "\u8FD0\u884C\u8BB0\u5F55\u8282\u70B9\u4E0D\u7B26\u6216\u672A\u6210\u529F");
+    need2(isRecord(run.inputs) && typeof run.inputs.op === "string" && ["table", "version", "save"].includes(run.inputs.op), "\u8BE5\u8FD0\u884C\u4E0D\u662F\u5B8C\u6574\u8868\u7ED3\u679C\uFF1Bhistory \u4EC5\u542B\u7248\u672C\u5217\u8868");
+    need2(isRecord(run.outputs) && run.outputs.status_code === 200 && typeof run.outputs.result_json === "string", "\u4E0A\u6B21\u8FD0\u884C\u6CA1\u6709\u6210\u529F\u7684\u5B8C\u6574 result_json");
+    if (ref.op) need2(run.inputs.op === ref.op, "\u4E0A\u6B21\u8FD0\u884C\u64CD\u4F5C\u4E0E\u5F53\u524D\u8282\u70B9\u914D\u7F6E\u4E0D\u7B26");
+    const preview = await previewStoreResult(run.outputs.result_json, ref, `\u4E0A\u6B21\u8FD0\u884C ${run.id}`);
+    const doc = preview.document;
+    need2(isRecord(doc), "\u8868\u4F53\u65E0\u6548");
+    if (typeof run.inputs.table === "string" && run.inputs.table.trim()) need2(run.inputs.table.trim() === doc.table, "\u5386\u53F2\u8F93\u5165\u8868\u540D\u4E0E\u7ED3\u679C\u4E0D\u7B26\uFF08\u4E0D\u731C\u6D4B\u522B\u540D\uFF09");
+    if (run.inputs.op === "version") need2(typeof run.inputs.version === "string" && /^\d+$/.test(run.inputs.version) && Number(run.inputs.version) === doc.version, "\u5386\u53F2\u8BF7\u6C42\u7248\u672C\u4E0E\u8FD4\u56DE\u8868\u4F53\u4E0D\u7B26");
+    need2(!signal.aborted, "\u8BFB\u53D6\u5DF2\u53D6\u6D88");
+    preview.provenance = `\u5DF2\u6709\u8FD0\u884C\u8BB0\u5F55 \xB7 ${run.id} \xB7 \u64CD\u4F5C ${run.inputs.op} \xB7 \u65F6\u95F4 ${typeof run.finished_at === "number" ? new Date(run.finished_at * 1e3).toISOString() : "\u672A\u63D0\u4F9B"}
+\u4EC5 GET \u8BFB\u53D6\u8BB0\u5F55\uFF1B\u672A\u6267\u884C\u8282\u70B9\u3002\u8BB0\u5F55\u53EF\u80FD\u65E9\u4E8E\u5F53\u524D\u914D\u7F6E\u6216\u5B58\u50A8\u7248\u672C\u3002
+` + preview.provenance.replace("\u672C\u5730\u5BFC\u5165\u5FEB\u7167", "\u5386\u53F2\u7ED3\u679C\u5FEB\u7167").replace("\u4E0D\u8054\u7F51\u3001\u4E0D\u6267\u884C\u3001\u4E0D\u4FDD\u5B58\u5230\u78C1\u76D8", "\u8BFB\u53D6\u5DF2\u6709\u8BB0\u5F55\u3001\u4E0D\u6267\u884C\u8282\u70B9\u3001\u4E0D\u4FDD\u5B58\u5230\u78C1\u76D8");
+    return preview;
+  }
+
   // src/reader-app.ts
   var connections;
   var uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
-  function need2(ok, text) {
+  function need3(ok, text) {
     if (!ok) throw Error(text);
   }
   function editor(url) {
     const u = new URL(url);
-    need2(u.protocol === "https:" || u.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname), "\u67E5\u8BE2\u8FDE\u63A5\u53EA\u652F\u6301 HTTPS \u6216\u672C\u673A\u56DE\u73AF\u9875\u9762");
-    need2(isWorkflowEditorLocation(u), "\u8BF7\u5728 Dify \u5DE5\u4F5C\u6D41\u7F16\u8F91\u9875\u9762\u8FDE\u63A5");
+    need3(u.protocol === "https:" || u.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname), "\u67E5\u8BE2\u8FDE\u63A5\u53EA\u652F\u6301 HTTPS \u6216\u672C\u673A\u56DE\u73AF\u9875\u9762");
+    need3(isWorkflowEditorLocation(u), "\u8BF7\u5728 Dify \u5DE5\u4F5C\u6D41\u7F16\u8F91\u9875\u9762\u8FDE\u63A5");
     const id = (/^\/app\/([^/]+)\/workflow\/?$/.exec(u.pathname) || /^\/v2\/app\/([^/]+)\/?$/.exec(u.pathname))?.[1];
-    need2(id && uuid.test(id), "\u8BF7\u5728 Dify \u5DE5\u4F5C\u6D41\u7F16\u8F91\u9875\u9762\u8FDE\u63A5");
+    need3(id && uuid.test(id), "\u8BF7\u5728 Dify \u5DE5\u4F5C\u6D41\u7F16\u8F91\u9875\u9762\u8FDE\u63A5");
     return { origin: u.origin, editorAppId: id };
   }
   function clearReaderConnections() {
@@ -606,26 +694,26 @@ ${ref.version || ref.digest ? "\u5DF2\u6838\u5BF9\u8282\u70B9\u7248\u672C/\u6458
   }
   function connectReaders(raw, url) {
     clearReaderConnections();
-    need2(raw.length <= 65536, "\u67E5\u8BE2\u8FDE\u63A5\u6587\u4EF6\u8D85\u8FC7 64 KiB");
+    need3(raw.length <= 65536, "\u67E5\u8BE2\u8FDE\u63A5\u6587\u4EF6\u8D85\u8FC7 64 KiB");
     const scope = editor(url), data = parseJson(raw);
-    need2(isRecord(data) && data.schema === "dmn-preview.reader-apps/v1", "\u67E5\u8BE2\u8FDE\u63A5\u6587\u4EF6\u683C\u5F0F\u4E0D\u652F\u6301");
-    need2(data.origin === scope.origin && data.editorAppId === scope.editorAppId, "\u67E5\u8BE2\u8FDE\u63A5\u4E0D\u5C5E\u4E8E\u5F53\u524D\u7AD9\u70B9\u548C\u7F16\u8F91\u5E94\u7528");
-    need2(Array.isArray(data.readers) && data.readers.length > 0 && data.readers.length <= 64, "\u67E5\u8BE2\u8FDE\u63A5\u5FC5\u987B\u6709 1..64 \u4E2A\u8868\u7ED1\u5B9A");
+    need3(isRecord(data) && data.schema === "dmn-preview.reader-apps/v1", "\u67E5\u8BE2\u8FDE\u63A5\u6587\u4EF6\u683C\u5F0F\u4E0D\u652F\u6301");
+    need3(data.origin === scope.origin && data.editorAppId === scope.editorAppId, "\u67E5\u8BE2\u8FDE\u63A5\u4E0D\u5C5E\u4E8E\u5F53\u524D\u7AD9\u70B9\u548C\u7F16\u8F91\u5E94\u7528");
+    need3(Array.isArray(data.readers) && data.readers.length > 0 && data.readers.length <= 64, "\u67E5\u8BE2\u8FDE\u63A5\u5FC5\u987B\u6709 1..64 \u4E2A\u8868\u7ED1\u5B9A");
     const keys = /* @__PURE__ */ new Set();
     const readers = data.readers.map((r) => {
-      need2(isRecord(r) && typeof r.table === "string" && r.table.length > 0 && r.table.length <= 256 && ["latest", "version"].includes(String(r.mode)), "\u67E5\u8BE2\u8868\u7ED1\u5B9A\u65E0\u6548");
-      need2(typeof r.appCode === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(r.appCode), "\u67E5\u8BE2\u5E94\u7528\u4EE3\u7801\u65E0\u6548");
-      need2(typeof r.readAppId === "string" && uuid.test(r.readAppId) && typeof r.publishedWorkflowId === "string" && uuid.test(r.publishedWorkflowId), "\u67E5\u8BE2\u5E94\u7528\u6216\u53D1\u5E03\u7248\u672C\u7F16\u53F7\u65E0\u6548");
+      need3(isRecord(r) && typeof r.table === "string" && r.table.length > 0 && r.table.length <= 256 && ["latest", "version"].includes(String(r.mode)), "\u67E5\u8BE2\u8868\u7ED1\u5B9A\u65E0\u6548");
+      need3(typeof r.appCode === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(r.appCode), "\u67E5\u8BE2\u5E94\u7528\u4EE3\u7801\u65E0\u6548");
+      need3(typeof r.readAppId === "string" && uuid.test(r.readAppId) && typeof r.publishedWorkflowId === "string" && uuid.test(r.publishedWorkflowId), "\u67E5\u8BE2\u5E94\u7528\u6216\u53D1\u5E03\u7248\u672C\u7F16\u53F7\u65E0\u6548");
       const key = r.table + "/" + r.mode;
-      need2(!keys.has(key), "\u67E5\u8BE2\u8868\u7ED1\u5B9A\u91CD\u590D");
+      need3(!keys.has(key), "\u67E5\u8BE2\u8868\u7ED1\u5B9A\u91CD\u590D");
       keys.add(key);
       return { table: r.table, mode: r.mode, appCode: r.appCode, readAppId: r.readAppId, publishedWorkflowId: r.publishedWorkflowId };
     });
     connections = { ...scope, readers };
   }
   async function responseText(response) {
-    need2(response.ok, `\u67E5\u8BE2\u63A5\u53E3\u8FD4\u56DE HTTP ${response.status}\uFF1B\u8BF7\u68C0\u67E5\u5E94\u7528\u8BBF\u95EE\u6743\u9650`);
-    need2(response.body, "\u67E5\u8BE2\u63A5\u53E3\u6CA1\u6709\u54CD\u5E94\u4F53");
+    need3(response.ok, `\u67E5\u8BE2\u63A5\u53E3\u8FD4\u56DE HTTP ${response.status}\uFF1B\u8BF7\u68C0\u67E5\u5E94\u7528\u8BBF\u95EE\u6743\u9650`);
+    need3(response.body, "\u67E5\u8BE2\u63A5\u53E3\u6CA1\u6709\u54CD\u5E94\u4F53");
     const reader = response.body.getReader(), decoder = new TextDecoder("utf-8", { fatal: true });
     let size = 0, text = "";
     try {
@@ -633,7 +721,7 @@ ${ref.version || ref.digest ? "\u5DF2\u6838\u5BF9\u8282\u70B9\u7248\u672C/\u6458
         const part = await reader.read();
         if (part.done) break;
         size += part.value.byteLength;
-        need2(size <= 8 * 1024 * 1024, "\u67E5\u8BE2\u54CD\u5E94\u8D85\u8FC7 8 MiB\uFF0C\u672A\u663E\u793A\u622A\u65AD\u8868");
+        need3(size <= 8 * 1024 * 1024, "\u67E5\u8BE2\u54CD\u5E94\u8D85\u8FC7 8 MiB\uFF0C\u672A\u663E\u793A\u622A\u65AD\u8868");
         text += decoder.decode(part.value, { stream: true });
       }
       return text + decoder.decode();
@@ -644,15 +732,15 @@ ${ref.version || ref.digest ? "\u5DF2\u6838\u5BF9\u8282\u70B9\u7248\u672C/\u6458
     }
   }
   async function readFromApp(ref, url, signal, request = globalThis.fetch) {
-    need2(readerConnected(url) && connections, "\u5C1A\u672A\u8FDE\u63A5\u5F53\u524D\u5E94\u7528\u7684\u53EA\u8BFB\u67E5\u8BE2\u5E94\u7528");
+    need3(readerConnected(url) && connections, "\u5C1A\u672A\u8FDE\u63A5\u5F53\u524D\u5E94\u7528\u7684\u53EA\u8BFB\u67E5\u8BE2\u5E94\u7528");
     const scope = connections;
     const mode = ref.version ? "version" : "latest";
     const rd = scope.readers.find((r) => r.table === ref.table && r.mode === mode);
-    need2(rd, `\u6CA1\u6709\u8BE5\u8868\u7684 ${mode === "version" ? "\u6307\u5B9A\u7248\u672C" : "\u5F53\u524D\u7248\u672C"} \u67E5\u8BE2\u7ED1\u5B9A\uFF1B\u672A\u56DE\u9000\u5176\u4ED6\u8BFB\u53D6\u8DEF\u5F84`);
-    if (ref.version) need2(/^[1-9]\d*$/.test(ref.version) && Number.isSafeInteger(Number(ref.version)), "\u8282\u70B9\u7248\u672C\u5FC5\u987B\u662F\u6B63\u6574\u6570");
+    need3(rd, `\u6CA1\u6709\u8BE5\u8868\u7684 ${mode === "version" ? "\u6307\u5B9A\u7248\u672C" : "\u5F53\u524D\u7248\u672C"} \u67E5\u8BE2\u7ED1\u5B9A\uFF1B\u672A\u56DE\u9000\u5176\u4ED6\u8BFB\u53D6\u8DEF\u5F84`);
+    if (ref.version) need3(/^[1-9]\d*$/.test(ref.version) && Number.isSafeInteger(Number(ref.version)), "\u8282\u70B9\u7248\u672C\u5FC5\u987B\u662F\u6B63\u6574\u6570");
     const auth = await request(scope.origin + "/api/passport", { method: "GET", credentials: "same-origin", redirect: "error", cache: "no-store", signal, headers: { "X-App-Code": rd.appCode } });
     const passport = parseJson(await responseText(auth));
-    need2(isRecord(passport) && typeof passport.access_token === "string" && passport.access_token.length <= 16384, "\u65E0\u6CD5\u53D6\u5F97\u67E5\u8BE2\u5E94\u7528\u7684\u8BBF\u95EE\u8EAB\u4EFD\uFF1B\u8BF7\u5148\u5B8C\u6210\u8BE5\u5E94\u7528\u767B\u5F55");
+    need3(isRecord(passport) && typeof passport.access_token === "string" && passport.access_token.length <= 16384, "\u65E0\u6CD5\u53D6\u5F97\u67E5\u8BE2\u5E94\u7528\u7684\u8BBF\u95EE\u8EAB\u4EFD\uFF1B\u8BF7\u5148\u5B8C\u6210\u8BE5\u5E94\u7528\u767B\u5F55");
     const response = await request(scope.origin + "/api/workflows/run", {
       method: "POST",
       credentials: "same-origin",
@@ -667,19 +755,19 @@ ${ref.version || ref.digest ? "\u5DF2\u6838\u5BF9\u8282\u70B9\u7248\u672C/\u6458
     for (const line of text.split(/\r?\n/)) {
       if (!line.startsWith("data:")) continue;
       const event = parseJson(line.slice(5).trim());
-      need2(isRecord(event), "\u67E5\u8BE2\u4E8B\u4EF6\u683C\u5F0F\u65E0\u6548");
-      need2(event.event !== "error", "\u67E5\u8BE2\u5E94\u7528\u8FD0\u884C\u5931\u8D25\uFF1B\u672A\u53D6\u5F97\u5B8C\u6574\u8868");
+      need3(isRecord(event), "\u67E5\u8BE2\u4E8B\u4EF6\u683C\u5F0F\u65E0\u6548");
+      need3(event.event !== "error", "\u67E5\u8BE2\u5E94\u7528\u8FD0\u884C\u5931\u8D25\uFF1B\u672A\u53D6\u5F97\u5B8C\u6574\u8868");
       if (event.event === "workflow_finished") {
-        need2(!final && isRecord(event.data), "\u67E5\u8BE2\u7ED3\u675F\u4E8B\u4EF6\u65E0\u6548");
+        need3(!final && isRecord(event.data), "\u67E5\u8BE2\u7ED3\u675F\u4E8B\u4EF6\u65E0\u6548");
         final = event.data;
       }
     }
-    need2(final?.status === "succeeded" && final.workflow_id === rd.publishedWorkflowId, "\u67E5\u8BE2\u5931\u8D25\u6216\u5DF2\u53D1\u5E03\u5DE5\u4F5C\u6D41\u7248\u672C\u6539\u53D8\uFF1B\u8BF7\u7531\u7EF4\u62A4\u8005\u590D\u6838\u7ED1\u5B9A");
+    need3(final?.status === "succeeded" && final.workflow_id === rd.publishedWorkflowId, "\u67E5\u8BE2\u5931\u8D25\u6216\u5DF2\u53D1\u5E03\u5DE5\u4F5C\u6D41\u7248\u672C\u6539\u53D8\uFF1B\u8BF7\u7531\u7EF4\u62A4\u8005\u590D\u6838\u7ED1\u5B9A");
     const outputs = final.outputs;
-    need2(isRecord(outputs) && outputs.status_code === 200 && typeof outputs.result_json === "string", "\u67E5\u8BE2\u672A\u8FD4\u56DE\u6210\u529F\u8868\u4F53\uFF1B\u6307\u5B9A\u7248\u672C\u7F3A\u5931\u65F6\u4E0D\u56DE\u9000\u6700\u65B0\u7248");
-    need2(connections === scope && !signal.aborted, "\u67E5\u8BE2\u8FDE\u63A5\u5DF2\u5207\u6362\uFF0C\u7ED3\u679C\u5DF2\u4E22\u5F03");
+    need3(isRecord(outputs) && outputs.status_code === 200 && typeof outputs.result_json === "string", "\u67E5\u8BE2\u672A\u8FD4\u56DE\u6210\u529F\u8868\u4F53\uFF1B\u6307\u5B9A\u7248\u672C\u7F3A\u5931\u65F6\u4E0D\u56DE\u9000\u6700\u65B0\u7248");
+    need3(connections === scope && !signal.aborted, "\u67E5\u8BE2\u8FDE\u63A5\u5DF2\u5207\u6362\uFF0C\u7ED3\u679C\u5DF2\u4E22\u5F03");
     const preview = await importStored(outputs.result_json, ref, "\u5DF2\u53D1\u5E03\u67E5\u8BE2\u5E94\u7528\u54CD\u5E94", "reader");
-    need2(connections === scope && !signal.aborted, "\u67E5\u8BE2\u8FDE\u63A5\u5DF2\u5207\u6362\uFF0C\u7ED3\u679C\u5DF2\u4E22\u5F03");
+    need3(connections === scope && !signal.aborted, "\u67E5\u8BE2\u8FDE\u63A5\u5DF2\u5207\u6362\uFF0C\u7ED3\u679C\u5DF2\u4E22\u5F03");
     const finished = typeof final.finished_at === "number" && Math.abs(final.finished_at) < 864e10 ? new Date(final.finished_at * 1e3).toISOString() : "\u672A\u63D0\u4F9B";
     preview.provenance = `\u67E5\u8BE2\u5E94\u7528 ${rd.readAppId}
 \u53D1\u5E03\u7248\u672C ${rd.publishedWorkflowId}
@@ -718,6 +806,7 @@ ${preview.provenance}
       message.setAttribute("role", snapshot.status === "error" ? "alert" : "status");
       container.append(message);
       if (snapshot.storage) importControls(container, snapshot.storage);
+      if (snapshot.storeNode && snapshot.nodeId) storeControls(container, snapshot);
       return;
     }
     const parsed = snapshot.format === "dmn-xml" ? parseXml(snapshot, document2) : snapshot.format ? parseBrian(snapshot) : parseTable(snapshot.raw);
@@ -840,30 +929,6 @@ ${preview.provenance}
     );
     container.append(controls, refresh, disconnect, output);
     let attempt = 0;
-    function show(preview) {
-      const lines = preview.provenance.split("\n");
-      output.append(element(document2, "div", lines.filter((line) => line.startsWith("\u8868 ") || line.startsWith("content_sha256")).join("\n"), "dmnp-meta"));
-      const provenance = document2.createElement("details");
-      provenance.append(element(document2, "summary", "\u6765\u6E90\u3001\u8FD0\u884C\u8BB0\u5F55\u4E0E\u6458\u8981\u6821\u9A8C\uFF08\u5C55\u5F00\uFF09"), element(document2, "div", preview.provenance, "dmnp-status"));
-      output.append(provenance);
-      const select = document2.createElement("select");
-      select.setAttribute("aria-label", "\u9009\u62E9\u51B3\u7B56\u96C6\u6A21\u578B");
-      preview.models.forEach((m, i) => {
-        const option = document2.createElement("option");
-        option.value = String(i);
-        option.textContent = `${m.key} \xB7 ${m.matrix.table.id}`;
-        select.append(option);
-      });
-      if (preview.models.length > 1) output.append(select);
-      const matrix = element(document2, "div");
-      output.append(matrix);
-      const render = () => renderMatrix(matrix, preview.models[Number(select.value || 0)].matrix, true);
-      select.addEventListener("change", render);
-      render();
-      const details = document2.createElement("details");
-      details.append(element(document2, "summary", "\u5B8C\u6574\u5BFC\u5165\u6587\u6863\uFF08\u542B\u58F0\u660E\u3001\u5B57\u5178\u4E0E\u6A21\u677F\uFF09"), element(document2, "pre", JSON.stringify(preview.document, null, 2)));
-      output.append(details);
-    }
     async function load(source, task) {
       cancelPreview(container);
       const controller = new AbortController();
@@ -881,7 +946,7 @@ ${preview.provenance}
         container.dataset.status = source === "local" ? "imported" : "queried";
         if (referenceMessage) referenceMessage.textContent = source === "local" ? "\u8282\u70B9\u4EC5\u542B\u5B58\u50A8\u5F15\u7528\u3002\u4EE5\u4E0B\u5C55\u793A\u5DF2\u5BFC\u5165\u5FEB\u7167\uFF1B\u672A\u67E5\u8BE2\u7EBF\u4E0A\u5F53\u524D\u7248\u672C\u3002" : "\u8282\u70B9\u4EC5\u542B\u5B58\u50A8\u5F15\u7528\u3002\u4EE5\u4E0B\u8868\u4F53\u6765\u81EA\u5DF2\u6388\u6743\u67E5\u8BE2\u5E94\u7528\uFF0C\u5DF2\u6838\u5BF9\u8282\u70B9\u7248\u672C\u548C\u6458\u8981\u7EA6\u675F\u3002";
         controls.open = false;
-        show(preview);
+        showStored(output, preview);
       } catch (e) {
         if (!active()) return;
         container.dataset.status = "error";
@@ -921,6 +986,76 @@ ${preview.provenance}
     });
     if (readerConnected(document2.location.href)) void query();
   }
+  function showStored(output, preview) {
+    const document2 = output.ownerDocument;
+    const lines = preview.provenance.split("\n");
+    output.append(element(document2, "div", lines.filter((line) => line.startsWith("\u8868 ") || line.startsWith("content_sha256")).join("\n"), "dmnp-meta"));
+    const provenance = document2.createElement("details");
+    provenance.append(element(document2, "summary", "\u6765\u6E90\u3001\u8FD0\u884C\u8BB0\u5F55\u4E0E\u6458\u8981\u6821\u9A8C\uFF08\u5C55\u5F00\uFF09"), element(document2, "div", preview.provenance, "dmnp-status"));
+    output.append(provenance);
+    const select = document2.createElement("select");
+    select.setAttribute("aria-label", "\u9009\u62E9\u51B3\u7B56\u96C6\u6A21\u578B");
+    preview.models.forEach((m, i) => {
+      const option = document2.createElement("option");
+      option.value = String(i);
+      option.textContent = `${m.key} \xB7 ${m.matrix.table.id}`;
+      select.append(option);
+    });
+    if (preview.models.length > 1) output.append(select);
+    const matrix = element(document2, "div");
+    output.append(matrix);
+    const render = () => renderMatrix(matrix, preview.models[Number(select.value || 0)].matrix, true);
+    select.addEventListener("change", render);
+    render();
+    const details = document2.createElement("details");
+    details.append(element(document2, "summary", "\u5B8C\u6574\u5BFC\u5165\u6587\u6863\uFF08\u542B\u58F0\u660E\u3001\u5B57\u5178\u4E0E\u6A21\u677F\uFF09"), element(document2, "pre", JSON.stringify(preview.document, null, 2)));
+    output.append(details);
+  }
+  function storeControls(container, snapshot) {
+    const document2 = container.ownerDocument, generation = renderGenerations.get(container);
+    const activationUrl = document2.location.href;
+    const read = element(document2, "button", "\u8BFB\u53D6\u4E0A\u6B21\u8FD0\u884C\uFF08\u53EA\u8BFB\uFF09");
+    const input = document2.createElement("input");
+    input.type = "file";
+    input.accept = ".json,application/json";
+    input.setAttribute("aria-label", "\u5BFC\u5165\u5B58\u53D6\u7ED3\u679C result_json \u6216\u5DF2\u4FDD\u5B58\u8868 JSON");
+    const output = element(document2, "div");
+    container.append(element(document2, "p", "\u4E0B\u65B9\u53EA\u663E\u793A\u5DF2\u6709\u5386\u53F2\u5FEB\u7167\uFF0C\u4E0D\u4EE3\u8868\u5F53\u524D\u5B58\u50A8\u6700\u65B0\u7248\u3002\u6CA1\u6709\u5B8C\u6574\u8868\u4F53\u65F6\u4E0D\u4F1A\u751F\u6210\u8868\u683C\u3002", "dmnp-footnote"), read, input, output);
+    let attempt = 0;
+    async function load(task) {
+      cancelPreview(container);
+      const controller = new AbortController();
+      pendingReads.set(container, controller);
+      const current = ++attempt, timer = setTimeout(() => controller.abort(), 3e4);
+      const active = () => renderGenerations.get(container) === generation && attempt === current && container.isConnected && document2.location.href === activationUrl;
+      output.replaceChildren(element(document2, "div", "\u6B63\u5728\u8BFB\u53D6\u5E76\u6838\u5BF9\u5386\u53F2\u8868\u4F53\u3001\u7248\u672C\u548C\u6458\u8981\u2026", "dmnp-status"));
+      container.dataset.status = "dynamic";
+      try {
+        const preview = await task(controller.signal);
+        if (!active()) return;
+        if (controller.signal.aborted) throw Error("\u8BFB\u53D6\u5DF2\u53D6\u6D88\u6216\u8D85\u65F6");
+        output.replaceChildren(element(document2, "div", "\u5386\u53F2\u5FEB\u7167 \xB7 \u672A\u786E\u8BA4\u5F53\u524D\u5B58\u50A8\u7248\u672C", "dmnp-status"));
+        container.dataset.status = "historical";
+        showStored(output, preview);
+      } catch (e) {
+        if (!active()) return;
+        container.dataset.status = "error";
+        output.replaceChildren(element(document2, "div", controller.signal.aborted ? "\u8BFB\u53D6\u5DF2\u53D6\u6D88\u6216\u8D85\u65F6\uFF1B\u672A\u663E\u793A\u65E7\u8868\u3002" : e instanceof Error ? e.message : "\u8BFB\u53D6\u5931\u8D25", "dmnp-status"));
+      } finally {
+        clearTimeout(timer);
+        if (pendingReads.get(container) === controller) pendingReads.delete(container);
+      }
+    }
+    read.addEventListener("click", () => load((signal) => {
+      const observed = document2.defaultView?.performance.getEntriesByType?.("resource").map((entry) => entry.name) || [];
+      return readStoreLastRun(snapshot.storeNode, activationUrl, snapshot.nodeId, signal, observed);
+    }));
+    input.addEventListener("change", () => load(async () => {
+      const file = input.files?.[0];
+      if (!file || file.size > MAX_IMPORT_BYTES) throw Error("\u8BF7\u9009\u62E9\u4E0D\u8D85\u8FC7 832 KiB \u7684 JSON \u6587\u4EF6");
+      return previewStoreResult(await file.text(), snapshot.storeNode, file.name);
+    }));
+  }
 
   // src/content.ts
   var existing = document.getElementById("dmn-preview-extension-root");
@@ -949,6 +1084,7 @@ ${preview.provenance}
       if (snapshot.auxiliary !== void 0 && (typeof snapshot.auxiliary !== "string" || snapshot.auxiliary.length > MAX_TABLE_CHARS)) return;
       if (snapshot.format !== void 0 && !["brian-json", "brian-decision", "dmn-xml"].includes(snapshot.format)) return;
       if (snapshot.storage !== void 0 && (!snapshot.storage || typeof snapshot.storage !== "object" || typeof snapshot.storage.table !== "string" || typeof snapshot.storage.format !== "string" || Object.entries(snapshot.storage).some(([k, v]) => !["table", "format", "version", "digest"].includes(k) || typeof v !== "string" || v.length > 1024))) return;
+      if (snapshot.storeNode !== void 0 && (!snapshot.storeNode || typeof snapshot.storeNode !== "object" || Object.entries(snapshot.storeNode).some(([k, v]) => !["table", "version", "op"].includes(k) || typeof v !== "string" || v.length > 1024))) return;
       if (snapshot.nodeId !== void 0 && typeof snapshot.nodeId !== "string") return;
       if (snapshot.title !== void 0 && typeof snapshot.title !== "string") return;
       if (snapshot.message !== void 0 && typeof snapshot.message !== "string") return;
