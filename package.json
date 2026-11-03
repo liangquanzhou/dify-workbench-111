@@ -18,7 +18,9 @@
     "smoke:mcp:upstream": "DIFYWF_PROFILE=upstream node scripts/mcp-smoke.mjs",
     "smoke:mcp:http:upstream": "DIFYWF_PROFILE=upstream node scripts/mcp-smoke-http.mjs",
     "demo:legacy": "node scripts/legacy-demo.mjs",
-    "check": "npm run typecheck && npm test && npm run smoke:mcp && npm run demo:legacy"
+    "check": "npm run typecheck && npm test && npm run smoke:mcp && npm run demo:legacy && npm run check:browser",
+    "check:browser": "npm --prefix browser-extension ci --ignore-scripts && npm --prefix browser-extension run build && npm --prefix browser-extension run typecheck && npm --prefix browser-extension test",
+    "package:browser": "python3 browser-extension/scripts/package.py"
   },
   "license": "Apache-2.0",
   "devDependencies": {

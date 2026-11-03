@@ -16,3 +16,5 @@ cookies.json
 *.cookie
 dify-workbench.json
 SOURCE-MANIFEST.sha256
+
+browser-extension

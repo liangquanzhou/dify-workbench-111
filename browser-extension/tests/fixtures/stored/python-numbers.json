@@ -1,0 +1,248 @@
+{
+  "schema": "dmn-json.decision-table/v1",
+  "table": "triage.synthetic-sensors",
+  "owner": {
+    "app_id": "00000000-0000-4000-8000-000000000001",
+    "team": "SYNTHETIC",
+    "name": "Synthetic sensor laboratory"
+  },
+  "model_ref": "triage.synthetic-sensors@1.0.0",
+  "model": {
+    "profile": "service-decision-table-v1",
+    "version": "1.0.0",
+    "hit_policy": "FIRST",
+    "parameters": {
+      "sensor_a": {
+        "type": "boolean",
+        "nullable": false,
+        "record_required": true,
+        "allowed_quality": [
+          "KNOWN",
+          "UNKNOWN"
+        ]
+      },
+      "sensor_b": {
+        "type": "boolean",
+        "nullable": false,
+        "record_required": true,
+        "allowed_quality": [
+          "KNOWN",
+          "UNKNOWN"
+        ]
+      },
+      "sensor_c": {
+        "type": "boolean",
+        "nullable": false,
+        "record_required": true,
+        "allowed_quality": [
+          "KNOWN",
+          "UNKNOWN"
+        ]
+      },
+      "ready": {
+        "type": "boolean",
+        "nullable": false,
+        "record_required": true,
+        "allowed_quality": [
+          "KNOWN",
+          "UNKNOWN"
+        ]
+      }
+    },
+    "rules": [
+      {
+        "rule_id": "SENSOR_MATCH",
+        "when_any": [
+          [
+            {
+              "path": [
+                "parameters",
+                "sensor_a",
+                "value"
+              ],
+              "op": "eq",
+              "value": true
+            },
+            {
+              "path": [
+                "parameters",
+                "sensor_a",
+                "quality"
+              ],
+              "op": "eq",
+              "value": "KNOWN"
+            }
+          ],
+          [
+            {
+              "path": [
+                "parameters",
+                "sensor_b",
+                "value"
+              ],
+              "op": "eq",
+              "value": true
+            },
+            {
+              "path": [
+                "parameters",
+                "sensor_b",
+                "quality"
+              ],
+              "op": "eq",
+              "value": "KNOWN"
+            }
+          ],
+          [
+            {
+              "path": [
+                "parameters",
+                "sensor_c",
+                "value"
+              ],
+              "op": "eq",
+              "value": true
+            },
+            {
+              "path": [
+                "parameters",
+                "sensor_c",
+                "quality"
+              ],
+              "op": "eq",
+              "value": "KNOWN"
+            }
+          ]
+        ],
+        "output_template_ref": "signal"
+      },
+      {
+        "rule_id": "DEVICE_READY",
+        "when": [
+          {
+            "path": [
+              "parameters",
+              "ready",
+              "value"
+            ],
+            "op": "eq",
+            "value": true
+          },
+          {
+            "path": [
+              "parameters",
+              "ready",
+              "quality"
+            ],
+            "op": "eq",
+            "value": "KNOWN"
+          }
+        ],
+        "output_template_ref": "ready"
+      },
+      {
+        "rule_id": "SENSOR_DEFAULT",
+        "when": [
+          {
+            "path": [
+              "parameters",
+              "sensor_a",
+              "quality"
+            ],
+            "op": "eq",
+            "value": "KNOWN"
+          },
+          {
+            "path": [
+              "parameters",
+              "sensor_b",
+              "quality"
+            ],
+            "op": "eq",
+            "value": "KNOWN"
+          },
+          {
+            "path": [
+              "parameters",
+              "sensor_c",
+              "quality"
+            ],
+            "op": "eq",
+            "value": "KNOWN"
+          },
+          {
+            "path": [
+              "parameters",
+              "ready",
+              "quality"
+            ],
+            "op": "eq",
+            "value": "KNOWN"
+          }
+        ],
+        "output_template_ref": "idle"
+      }
+    ],
+    "result_templates": {
+      "signal": {
+        "state": "PASS",
+        "actions": [],
+        "data": {
+          "result": {
+            "literal": {
+              "decision": "SIGNAL",
+              "message": "Synthetic sensor result: signal"
+            }
+          },
+          "note": {
+            "literal": "Original synthetic regression fixture"
+          },
+          "numbers": {
+            "literal": {
+              "float_one": 1.0,
+              "negative_zero": -0.0,
+              "small": 1e-07,
+              "decimal": 1.25,
+              "": "BMP",
+              "𐀀": "astral"
+            }
+          }
+        }
+      },
+      "ready": {
+        "state": "PASS",
+        "actions": [],
+        "data": {
+          "result": {
+            "literal": {
+              "decision": "READY",
+              "message": "Synthetic sensor result: ready"
+            }
+          },
+          "note": {
+            "literal": "Original synthetic regression fixture"
+          }
+        }
+      },
+      "idle": {
+        "state": "PASS",
+        "actions": [],
+        "data": {
+          "result": {
+            "literal": {
+              "decision": "IDLE",
+              "message": "Synthetic sensor result: idle"
+            }
+          },
+          "note": {
+            "literal": "Original synthetic regression fixture"
+          }
+        }
+      }
+    },
+    "on_no_match": "ERROR"
+  },
+  "version": 3,
+  "saved_at": "2026-01-01T00:00:00Z",
+  "content_sha256": "e650e26672feb9f960921cae7edb14497a913e98a0454f3057da2bdb1cde590d"
+}

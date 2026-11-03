@@ -1,0 +1,38 @@
+{
+  "schema": "dmn-json.route-table/v2",
+  "table": "dispatch.route",
+  "issue_types": [
+    "SENSOR"
+  ],
+  "phases": [
+    "CHECK"
+  ],
+  "scenes": {
+    "LAB": {
+      "name": "Laboratory",
+      "domain": "Synthetic"
+    }
+  },
+  "solutions": {
+    "00000000-0000-4000-8000-000000000002": {
+      "name": "Sensor viewer",
+      "inputs": [
+        "sample_id"
+      ]
+    }
+  },
+  "routes": [
+    {
+      "scene_id": "LAB",
+      "issue_type": "SENSOR",
+      "phase": "CHECK",
+      "target": {
+        "kind": "SOLUTION_APP",
+        "app_id": "00000000-0000-4000-8000-000000000002"
+      }
+    }
+  ],
+  "version": 3,
+  "saved_at": "2026-01-01T00:00:00Z",
+  "content_sha256": "a292386337820b52c4be1e8bf3fbd3198281a97ab0d0679c2fd3bf301fd47811"
+}

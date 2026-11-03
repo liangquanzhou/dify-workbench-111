@@ -1,0 +1,31 @@
+name: Prepare DMN compatibility candidate
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+permissions:
+  contents: read
+jobs:
+  compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: browser-extension/package-lock.json
+      - name: Install locked local dependencies
+        run: npm ci --ignore-scripts
+        working-directory: browser-extension
+      - name: Discover latest release including prereleases and prepare candidate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 browser-extension/scripts/check-upstream.py --channel all --out compatibility-artifacts
+      - name: Retain candidate or review report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmn-compatibility-${{ github.run_id }}
+          path: compatibility-artifacts
+          if-no-files-found: error

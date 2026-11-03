@@ -1,3 +1,11 @@
+# 浏览器预览 0.4.0 · 配套模块
+
+既有 Workbench 仓库新增浏览器扩展，适配 Brian hu8627 的内联和存储 DMN 结构；保留 CLI/MCP 0.1.0 功能。没有自制 Dify 插件安装包。安装和读取存储表的方法见 [浏览器说明](../browser-extension/INSTALL-0.4.0.zh-CN.md)。
+
+浏览器真实隔离验收见 [记录](../browser-extension/docs/REAL-E2E-0.4.0.md)。既有 CI 通过 npm run check 同时检查 Workbench 与浏览器；定时上游监测模板尚未启用。
+
+以下为原 CLI/MCP 0.1.0 发布记录。
+
 # v0.1.0 · Dify 1.11.1 适配开发首版
 
 拟发布目标：`liangquanzhou/dify-workbench-111`。本说明描述准备好的源码，不代表已创建远程仓库、发布 GitHub Release 或部署服务。

@@ -7,3 +7,5 @@ Modifications (2026-09-30): added src/legacy Dify 1.11.1 profile, CLI dispatch,
 synthetic fixtures, safety/contract tests, mock demo, and adapter documentation.
 No company source code, business rules, account credentials, or case reports are included.
 The upstream project did not include a NOTICE file at the pinned commit.
+
+Modifications (2026-11-03): added the optional browser-extension module and documentation/check integration. Its code has a separate MIT license; see browser-extension/LICENSE and browser-extension/THIRD_PARTY_NOTICES.md. The Workbench CLI/MCP retains Apache-2.0.

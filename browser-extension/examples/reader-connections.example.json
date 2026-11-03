@@ -1,0 +1,9 @@
+{
+  "schema": "dmn-preview.reader-apps/v1",
+  "origin": "https://YOUR_DIFY_ORIGIN",
+  "editorAppId": "REPLACE_EDITOR_APP_UUID",
+  "readers": [
+    {"table": "REPLACE_TABLE_NAME", "mode": "latest", "appCode": "REPLACE_LATEST_APP_SITE_CODE", "readAppId": "REPLACE_LATEST_APP_UUID", "publishedWorkflowId": "REPLACE_LATEST_PUBLISHED_WORKFLOW_UUID"},
+    {"table": "REPLACE_TABLE_NAME", "mode": "version", "appCode": "REPLACE_VERSION_APP_SITE_CODE", "readAppId": "REPLACE_VERSION_APP_UUID", "publishedWorkflowId": "REPLACE_VERSION_PUBLISHED_WORKFLOW_UUID"}
+  ]
+}
