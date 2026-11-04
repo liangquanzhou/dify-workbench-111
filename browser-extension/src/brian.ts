@@ -1,4 +1,4 @@
-import { buildMatrix, isRecord, literal, own, parseJson } from './model'
+import { buildMatrix, isRecord, literal, own, parseJson, MAX_DEFINITION_BYTES } from './model'
 import type { Json, Matrix, Rule } from './model'
 import type { Snapshot, StoredReference } from './binding'
 
@@ -6,9 +6,9 @@ const operators: Record<string, string> = { eq: '=', ne: '≠', lt: '<', lte: '�
 function requireShape(ok: unknown, message: string): asserts ok {
   if (!ok) throw Error(message)
 }
-function object(raw: string | undefined, name: string): Record<string, Json> {
-  requireShape(typeof raw === 'string' && new TextEncoder().encode(raw).length <= 512 * 1024, `${name} 缺失或超过 512 KiB`)
-  const value = parseJson(raw)
+function object(raw: string | undefined, name: string, maxBytes = 512 * 1024): Record<string, Json> {
+  requireShape(typeof raw === 'string' && raw.length <= maxBytes && new TextEncoder().encode(raw).length <= maxBytes, `${name} 缺失或超过 ${maxBytes / 1024} KiB`)
+  const value = parseJson(raw, maxBytes)
   requireShape(isRecord(value), `${name} 必须为 JSON 对象`)
   return value
 }
@@ -30,9 +30,9 @@ export function matrixFor(model: Record<string, Json>, id: string, service: bool
   const ids = new Set<string>()
   const rules: Rule[] = model.rules.map((r): Rule => {
     requireShape(isRecord(r), '规则必须为对象')
-    // evaluate_decision at the pinned release only executes `when`. when_any belongs
-    // to stored-table evaluation: do not flatten it or silently ignore it here.
-    exact(r, service ? ['rule_id', stored && own(r, 'when_any') ? 'when_any' : 'when', 'output_template_ref'] : ['id', 'when', 'output'], '规则（内联节点不支持 when_any）')
+    // v0.5.19 permits OR groups in both service modes. Exact keys enforce
+    // when/when_any exclusivity; json-table-v1 still accepts only when.
+    exact(r, service ? ['rule_id', own(r, 'when_any') ? 'when_any' : 'when', 'output_template_ref'] : ['id', 'when', 'output'], '规则（when 与 when_any 只能有一个）')
     const rid = service ? r.rule_id : r.id
     requireShape(typeof rid === 'string' && rid.length && !ids.has(rid), '规则 ID 缺失或重复')
     ids.add(rid)
@@ -43,9 +43,9 @@ export function matrixFor(model: Record<string, Json>, id: string, service: bool
   const matrix = buildMatrix({ id, hit_policy: model.hit_policy as 'FIRST' | 'COLLECT' | 'UNIQUE', rules })
   model.rules.forEach((r, index) => {
     const rule = r as Record<string, Json>
-    const any = stored && own(rule, 'when_any')
+    const any = service && own(rule, 'when_any')
     const groups = any ? rule.when_any : [rule.when]
-    requireShape(Array.isArray(groups) && groups.length > 0 && groups.length <= 32, 'when_any 必须包含 1..32 个条件组')
+    requireShape(Array.isArray(groups) && groups.length > 0 && groups.length <= 128, 'when_any 必须包含 1..128 个条件组')
     const groupedAtoms = groups.map((conditions, groupIndex) => {
       requireShape(Array.isArray(conditions) && conditions.length <= 32 && (!any || conditions.length > 0), 'when 必须为最多 32 项的 AND 条件数组')
       const atoms = conditions.map((c, i) => {
@@ -73,6 +73,12 @@ export function matrixFor(model: Record<string, Json>, id: string, service: bool
   })
   matrix.note = `${service ? 'service-decision-table-v1' : 'json-table-v1'} · 版本 ${model.version} · 结构预览，不校验运行条件`
   if (service) {
+    if (model.rules.some(r => isRecord(r) && own(r, 'when_any') && (!stored || (Array.isArray(r.when_any) && r.when_any.length > 32))))
+      matrix.note += ' · 此 when_any 结构需要上游 v0.5.19 或兼容版本'
+    if (stored && isRecord(model.parameters)) {
+      const sources = Object.entries(model.parameters).filter(([, parameter]) => isRecord(parameter) && own(parameter, 'from_table'))
+      if (sources.length) matrix.note += ' · 模型回执来源约束（未求值）：' + sources.map(([name, parameter]) => `${literal(name)} → ${literal((parameter as Record<string, Json>).from_table)}`).join('；')
+    }
     requireShape(model.on_no_match === 'ERROR' || model.on_no_match === 'RESULT_TEMPLATE', '不支持的 on_no_match')
     matrix.note += ` · 无匹配：${model.on_no_match}`
     if (model.on_no_match === 'RESULT_TEMPLATE') {
@@ -85,7 +91,7 @@ export function matrixFor(model: Record<string, Json>, id: string, service: bool
 
 export function parseBrian(snapshot: Snapshot): { kind: 'ready'; matrix: Matrix } | { kind: 'error' | 'unsupported'; message: string; storage?: StoredReference } {
   try {
-    const t = object(snapshot.raw, snapshot.format === 'brian-json' ? 'table_json' : 'definition_bundle_json')
+    const t = object(snapshot.raw, snapshot.format === 'brian-json' ? 'table_json' : 'definition_bundle_json', snapshot.format === 'brian-json' ? 512 * 1024 : MAX_DEFINITION_BYTES)
     if (snapshot.format === 'brian-json') {
       exact(t, ['format', 'id', 'version', 'hit_policy', 'rules'], 'json-table-v1')
       requireShape(t.format === 'json-table-v1' && typeof t.id === 'string' && t.id.length, '需要 json-table-v1 和 id')

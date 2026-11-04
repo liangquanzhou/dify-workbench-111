@@ -9,7 +9,7 @@ dependencies:
 - current_identifier: null
   type: package
   value:
-    plugin_unique_identifier: hu8627/dmn_json:0.5.18@d6090dbe1a142828fc63b1f5d32af289fcdafa1020dd0c32997188782f93c018
+    plugin_unique_identifier: hu8627/dmn_json:0.5.19@8512f892fa62cebbddfeb4c7f5ef6d3e9dcd85313003738ffca9680afb0c923b
     version: null
 kind: app
 version: 0.5.0

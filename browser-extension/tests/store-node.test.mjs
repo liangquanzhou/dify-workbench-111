@@ -9,6 +9,10 @@ const url='https://dify.test/app/11111111-1111-4111-8111-111111111111/workflow'
 const node='store', signal=()=>new AbortController().signal
 const run=()=>({id:'synthetic-last-run',node_id:node,node_type:'tool',status:'succeeded',finished_at:1700000000,inputs:{op:'version',table,version:'3'},outputs:{status_code:200,result_json:raw}})
 const request=(value=run())=>async()=>new Response(JSON.stringify(value))
+async function until(check) {
+ for(let i=0;i<100;i++){if(check())return;await new Promise(r=>setTimeout(r,5))}
+ assert.fail('historical preview did not settle')
+}
 const snapshot=()=>extractTable({type:'tool',provider_type:'builtin',provider_id:'hu8627/dmn_json/dmn_json',tool_name:'route_table_store',title:'路由表存取',tool_parameters:Object.fromEntries(['op','table','version','body_json'].map(k=>[k,{type:'variable',value:['start',k]}]))},node)
 test('variable-bound route_table_store is recognized without pretending config is a table',()=>{
  const s=snapshot();assert.equal(s.status,'dynamic');assert.deepEqual(s.storeNode,{});assert.match(s.message,/不会执行节点/);assert.equal(s.raw,undefined)
@@ -61,8 +65,8 @@ test('UI shows labeled historical matrix and clears it after a failed refresh',a
  const original=globalThis.fetch
  try{
   const dom=new JSDOM('<main></main>',{url}), c=dom.window.document.querySelector('main')
-  globalThis.fetch=request();renderSnapshot(c,snapshot());c.querySelector('button').click();await new Promise(r=>setTimeout(r,10))
+  globalThis.fetch=request();renderSnapshot(c,snapshot());c.querySelector('button').click();await until(()=>c.dataset.status==='historical')
   assert.equal(c.dataset.status,'historical');assert.equal(c.querySelectorAll('tbody tr').length,3);assert.match(c.textContent,/未确认当前存储版本/)
-  globalThis.fetch=async()=>new Response('{}',{status:404});c.querySelector('button').click();await new Promise(r=>setTimeout(r,10));assert.equal(c.dataset.status,'error');assert.equal(c.querySelector('table'),null)
+  globalThis.fetch=async()=>new Response('{}',{status:404});c.querySelector('button').click();await until(()=>c.dataset.status==='error');assert.equal(c.dataset.status,'error');assert.equal(c.querySelector('table'),null)
  }finally{globalThis.fetch=original}
 })

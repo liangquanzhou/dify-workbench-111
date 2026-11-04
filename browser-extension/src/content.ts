@@ -1,4 +1,5 @@
 import { REFRESH_EVENT, SNAPSHOT_EVENT, STOP_EVENT, MAX_TABLE_CHARS } from './binding'
+import { MAX_DEFINITION_BYTES } from './model'
 import type { Snapshot } from './binding'
 import { element, renderSnapshot, cancelPreview } from './view'
 import { clearReaderConnections } from './reader-app'
@@ -34,12 +35,14 @@ if (existing) {
   }
   function receive(event: Event) {
     const detail = (event as CustomEvent).detail
-    if (typeof detail !== 'string' || detail.length > MAX_TABLE_CHARS * 4 + 8192) return
+    // JSON-encoded valid raw/auxiliary text can double in size when escaped.
+    if (typeof detail !== 'string' || detail.length > (MAX_DEFINITION_BYTES + MAX_TABLE_CHARS) * 2 + 8192) return
     let snapshot: Snapshot
     try { snapshot = JSON.parse(detail) } catch { return }
     if (!snapshot || !['ready', 'empty', 'dynamic', 'unsupported', 'idle', 'error'].includes(snapshot.status)) return
-    if (snapshot.raw !== undefined && (typeof snapshot.raw !== 'string' || snapshot.raw.length > MAX_TABLE_CHARS)) return
-    if (snapshot.auxiliary !== undefined && (typeof snapshot.auxiliary !== 'string' || snapshot.auxiliary.length > MAX_TABLE_CHARS)) return
+    const rawLimit = snapshot.format === 'brian-decision' ? MAX_DEFINITION_BYTES : MAX_TABLE_CHARS
+    if (snapshot.raw !== undefined && (typeof snapshot.raw !== 'string' || snapshot.raw.length > rawLimit || new TextEncoder().encode(snapshot.raw).length > rawLimit)) return
+    if (snapshot.auxiliary !== undefined && (typeof snapshot.auxiliary !== 'string' || snapshot.auxiliary.length > MAX_TABLE_CHARS || new TextEncoder().encode(snapshot.auxiliary).length > MAX_TABLE_CHARS)) return
     if (snapshot.format !== undefined && !['brian-json', 'brian-decision', 'dmn-xml'].includes(snapshot.format)) return
     if (snapshot.storage !== undefined && (!snapshot.storage || typeof snapshot.storage !== 'object' || typeof snapshot.storage.table !== 'string' || typeof snapshot.storage.format !== 'string' || Object.entries(snapshot.storage).some(([k, v]) => !['table', 'format', 'version', 'digest'].includes(k) || typeof v !== 'string' || v.length > 1024))) return
     if (snapshot.storeNode !== undefined && (!snapshot.storeNode || typeof snapshot.storeNode !== 'object' || Object.entries(snapshot.storeNode).some(([k, v]) => !['table', 'version', 'op'].includes(k) || typeof v !== 'string' || v.length > 1024))) return

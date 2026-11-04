@@ -39,6 +39,12 @@ export type Matrix = {
 export const isRecord = (v: unknown): v is Record<string, Json> => v !== null && typeof v === 'object' && !Array.isArray(v)
 export const own = (v: object, k: string) => Object.prototype.hasOwnProperty.call(v, k)
 export const literal = (v: Json): string => JSON.stringify(v)
+// A JSON value needs at least two bytes on average (e.g. [0,0,...]).
+// This covers every JSON tree within the largest accepted definition (1 MiB),
+// including v0.5.19's 128 × 32 predicates, while bounding object-valued inputs.
+export const MAX_JSON_BYTES = 832 * 1024
+export const MAX_DEFINITION_BYTES = 1024 * 1024
+export const MAX_JSON_VALUES = Math.ceil(MAX_DEFINITION_BYTES / 2) + 1
 const binary = ['eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'contains', 'not_contains', 'all_values', 'is_minimum']
 const tolerance = ['within', 'below', 'above']
 const symbols: Record<string, string> = { eq: '=', ne: '≠', gt: '>', gte: '≥', lt: '<', lte: '≤', contains: '包含', not_contains: '不包含', all_values: '全部值等于', is_minimum: '为最小值于', within: '接近', below: '低于', above: '高于' }
@@ -148,13 +154,15 @@ function validateExpression(v: Json, depth = 0): void {
       fail('变量引用结构错误')
   }
 }
-export function parseJson(value: string): unknown {
+export function parseJson(value: string, maxBytes = MAX_JSON_BYTES): unknown {
+  if (maxBytes > MAX_DEFINITION_BYTES || value.length > maxBytes || new TextEncoder().encode(value).length > maxBytes)
+    fail(`JSON 超过 ${maxBytes / 1024} KiB`)
   const t: unknown = JSON.parse(value)
   uniqueKeys(value)
   let count = 0
   function walk(v: unknown) {
-    if (++count > 20000)
-      fail('JSON 值节点超过 20,000')
+    if (++count > MAX_JSON_VALUES)
+      fail('JSON 值节点超过预览结构限制')
     if (typeof v === 'number' && (!Number.isFinite(v) || (Number.isInteger(v) && !Number.isSafeInteger(v))))
       fail('数值超出安全范围')
     if (typeof v === 'string')

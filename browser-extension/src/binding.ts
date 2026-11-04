@@ -1,4 +1,5 @@
 /** Page-owned data is untrusted. This adapter only reads own data properties. */
+import { MAX_JSON_VALUES, MAX_DEFINITION_BYTES } from './model'
 export const PROVIDER = 'liangquanzhou/dmn_decision/dmn'
 export const BRIAN_JSON_PROVIDER = 'hu8627/dmn_json/dmn_json'
 export const BRIAN_XML_PROVIDER = 'hu8627/dmn/dmn'
@@ -34,22 +35,37 @@ export function extractTable(data: unknown, nodeId: string): Snapshot {
   }
   if (raw === undefined || raw === null || raw === '') return { ...base, status: 'empty', message: '此节点尚未配置 table_json。' }
   if (typeof raw !== 'string') return { ...base, status: 'error', message: 'table_json 必须是 JSON 字符串。' }
-  if (raw.length > MAX_TABLE_CHARS) return { ...base, status: 'error', message: 'table_json 超过预览大小限制。' }
+  if (raw.length > MAX_TABLE_CHARS || new TextEncoder().encode(raw).length > MAX_TABLE_CHARS) return { ...base, status: 'error', message: 'table_json 超过 512 KiB 预览大小限制。' }
   return { ...base, status: 'ready', raw }
 }
 
 // Serialize object-valued form parameters without invoking page getters or toJSON.
-function serializeParameter(value: unknown): string {
+function serializeParameter(value: unknown, maxBytes: number): string {
   let count = 0
+  let bytes = 0
+  const encoder = new TextEncoder()
+  const charge = (text: string) => {
+    bytes += encoder.encode(text).length
+    if (bytes > maxBytes) throw Error(`参数超过 ${maxBytes / 1024} KiB 预览大小限制`)
+  }
+  const chargeString = (text: string) => {
+    if (text.length > maxBytes) throw Error(`参数超过 ${maxBytes / 1024} KiB 预览大小限制`)
+    charge(JSON.stringify(text))
+  }
   function copy(v: unknown, depth: number): unknown {
-    if (++count > 20000 || depth > 32) throw Error('参数超过预览结构限制')
+    if (++count > MAX_JSON_VALUES || depth > 32) throw Error('参数超过预览结构限制')
     if (typeof v === 'number' && (!Number.isFinite(v) || (Number.isInteger(v) && !Number.isSafeInteger(v)))) throw Error('数值超出安全范围')
-    if (v === null || ['string', 'boolean', 'number'].includes(typeof v)) return v
+    if (typeof v === 'string') { chargeString(v); return v }
+    if (v === null || typeof v === 'boolean' || typeof v === 'number') { charge(JSON.stringify(v)); return v }
     if (!v || typeof v !== 'object') throw Error('参数不是 JSON 数据')
-    if (Array.isArray(v) && v.length > 20000) throw Error('参数超过预览结构限制')
+    if (Array.isArray(v) && v.length > MAX_JSON_VALUES) throw Error('参数超过预览结构限制')
     const keys = Array.isArray(v) ? Array.from({ length: v.length }, (_, i) => String(i)) : Object.keys(v)
-    if (keys.length > 20000) throw Error('参数超过预览结构限制')
+    if (keys.length > MAX_JSON_VALUES) throw Error('参数超过预览结构限制')
+    // Account for delimiters, keys and values before copying further children.
+    // Repeated references cannot expand a small page object into a huge JSON string.
+    charge((Array.isArray(v) ? '[]' : '{}') + ','.repeat(Math.max(0, keys.length - 1)))
     const entries = keys.map(k => {
+      if (!Array.isArray(v)) { chargeString(k); charge(':') }
       const descriptor = Object.getOwnPropertyDescriptor(v, k)
       if (!descriptor || !('value' in descriptor)) throw Error('参数含不可读取的属性')
       return [k, copy(descriptor.value, depth + 1)] as const
@@ -58,7 +74,7 @@ function serializeParameter(value: unknown): string {
   }
   return JSON.stringify(copy(value, 0))
 }
-function readParameter(data: unknown, name: string, location: 'tool_configurations' | 'tool_parameters'): Snapshot {
+function readParameter(data: unknown, name: string, location: 'tool_configurations' | 'tool_parameters', maxBytes = MAX_TABLE_CHARS): Snapshot {
   let raw = ownValue(ownValue(data, location), name)
   if (raw && typeof raw === 'object' && ownValue(raw, 'type') !== undefined) {
     const type = ownValue(raw, 'type')
@@ -68,8 +84,8 @@ function readParameter(data: unknown, name: string, location: 'tool_configuratio
   if (typeof raw === 'string' && /\{\{#.*?#\}\}/s.test(raw)) return { status: 'dynamic', message: `${name} 含未解析变量；无法确认内容。` }
   if (raw === undefined || raw === null || raw === '') return { status: 'empty', message: `尚未配置 ${name}。` }
   try {
-    if (typeof raw !== 'string') raw = serializeParameter(raw)
-    if ((raw as string).length > MAX_TABLE_CHARS) throw Error(`${name} 超过预览大小限制`)
+    if (typeof raw !== 'string') raw = serializeParameter(raw, maxBytes)
+    if ((raw as string).length > maxBytes || new TextEncoder().encode(raw as string).length > maxBytes) throw Error(`${name} 超过 ${maxBytes / 1024} KiB 预览大小限制`)
     return { status: 'ready', raw: raw as string }
   } catch (e) { return { status: 'error', message: e instanceof Error ? e.message : '参数读取失败' } }
 }
@@ -80,7 +96,7 @@ function extractBrian(data: unknown, nodeId: string, provider: unknown): Snapsho
   if (provider === BRIAN_JSON_PROVIDER && tool === 'evaluate_json_table')
     return { ...base, ...readParameter(data, 'table_json', 'tool_configurations'), format: 'brian-json' }
   if (provider === BRIAN_JSON_PROVIDER && tool === 'evaluate_decision') {
-    const bundle = readParameter(data, 'definition_bundle_json', 'tool_configurations')
+    const bundle = readParameter(data, 'definition_bundle_json', 'tool_configurations', MAX_DEFINITION_BYTES)
     const ref = readParameter(data, 'node_ref', 'tool_configurations')
     if (bundle.status !== 'ready') return { ...base, ...bundle }
     if (ref.status !== 'ready') return { ...base, ...ref }

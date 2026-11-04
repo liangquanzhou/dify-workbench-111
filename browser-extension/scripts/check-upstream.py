@@ -105,7 +105,13 @@ def main():
             if report['changed_contracts']:
                 report['status'] = 'REVIEW_REQUIRED'
                 report['reason'] = 'Upstream contract changed. Passing examples do not prove changed semantics. Adapt/review before updating baseline or publishing.'
-                (args.out / 'candidate-upstream-lock.json').write_text(json.dumps({**baseline, 'commit': sha, 'hashes': current}, indent=2) + '\n')
+                # A proposed SHA must not inherit the old release tag/status.
+                # Offline refs do not establish GitHub prerelease metadata.
+                candidate = {**baseline, 'commit': sha, 'hashes': current,
+                             'tag': report.get('release', {}).get('tag_name', ref if ref.startswith('v') else None),
+                             'prerelease': report.get('release', {}).get('prerelease'),
+                             'verification': 'REVIEW_REQUIRED', 'baseline_commit': baseline['commit']}
+                (args.out / 'candidate-upstream-lock.json').write_text(json.dumps(candidate, indent=2) + '\n')
                 return 2
             archive = args.out / f'dmn-preview-candidate-{sha[:12]}.zip'
             with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as z:

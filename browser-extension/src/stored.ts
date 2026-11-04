@@ -1,9 +1,9 @@
-import { buildMatrix, isRecord, literal, own, parseJson } from './model'
+import { buildMatrix, isRecord, literal, own, parseJson, MAX_JSON_BYTES } from './model'
 import { matrixFor } from './brian'
 import type { Json, Matrix } from './model'
 import type { StoredReference } from './binding'
 
-export const MAX_IMPORT_BYTES = 832 * 1024
+export const MAX_IMPORT_BYTES = MAX_JSON_BYTES
 export type StoredPreview = { models: { key: string; matrix: Matrix }[]; document: Json; provenance: string }
 const schemas: Record<string, string[]> = {
   'decision-table/v1': ['dmn-json.decision-table/v1'],
@@ -136,5 +136,5 @@ export async function importStored(raw: string, ref: StoredReference, filename: 
   }
   const fileHash = await sha256(raw)
   const provenance = `${source === 'local' ? '本地导入快照' : '查询响应快照'} · ${filename.slice(0, 200)}\n表 ${ref.table} · 已保存版本 ${doc.version} · 保存时间 ${typeof doc.saved_at === 'string' ? doc.saved_at : '未提供'}\ncontent_sha256 ${digest}\n原文 SHA-256 ${fileHash}\n${ref.version || ref.digest ? '已核对节点版本/摘要约束' : source === 'local' ? '节点未钉版本；此快照是否为线上最新版未知' : '节点未钉版本；显示这次查询返回的版本'} · ${source === 'local' ? '摘要一致不证明文件来源身份 · 不联网、不执行、不保存到磁盘' : '摘要一致不代替查询应用权限审查 · 仅在当前预览内保存'}`
-  return { models, document: doc, provenance }
+  return { models, document: doc, provenance: provenance + '\n模型 from_table 计入内容摘要；declare 不在 content_sha256 内。仅显示声明原文，未执行 STANDARD 保存校验。' }
 }

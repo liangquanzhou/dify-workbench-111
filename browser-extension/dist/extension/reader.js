@@ -1,5 +1,10 @@
 "use strict";
 (() => {
+  // src/model.ts
+  var MAX_JSON_BYTES = 832 * 1024;
+  var MAX_DEFINITION_BYTES = 1024 * 1024;
+  var MAX_JSON_VALUES = Math.ceil(MAX_DEFINITION_BYTES / 2) + 1;
+
   // src/binding.ts
   var PROVIDER = "liangquanzhou/dmn_decision/dmn";
   var BRIAN_JSON_PROVIDER = "hu8627/dmn_json/dmn_json";
@@ -31,20 +36,42 @@
     }
     if (raw === void 0 || raw === null || raw === "") return { ...base, status: "empty", message: "\u6B64\u8282\u70B9\u5C1A\u672A\u914D\u7F6E table_json\u3002" };
     if (typeof raw !== "string") return { ...base, status: "error", message: "table_json \u5FC5\u987B\u662F JSON \u5B57\u7B26\u4E32\u3002" };
-    if (raw.length > MAX_TABLE_CHARS) return { ...base, status: "error", message: "table_json \u8D85\u8FC7\u9884\u89C8\u5927\u5C0F\u9650\u5236\u3002" };
+    if (raw.length > MAX_TABLE_CHARS || new TextEncoder().encode(raw).length > MAX_TABLE_CHARS) return { ...base, status: "error", message: "table_json \u8D85\u8FC7 512 KiB \u9884\u89C8\u5927\u5C0F\u9650\u5236\u3002" };
     return { ...base, status: "ready", raw };
   }
-  function serializeParameter(value) {
+  function serializeParameter(value, maxBytes) {
     let count = 0;
+    let bytes = 0;
+    const encoder = new TextEncoder();
+    const charge = (text) => {
+      bytes += encoder.encode(text).length;
+      if (bytes > maxBytes) throw Error(`\u53C2\u6570\u8D85\u8FC7 ${maxBytes / 1024} KiB \u9884\u89C8\u5927\u5C0F\u9650\u5236`);
+    };
+    const chargeString = (text) => {
+      if (text.length > maxBytes) throw Error(`\u53C2\u6570\u8D85\u8FC7 ${maxBytes / 1024} KiB \u9884\u89C8\u5927\u5C0F\u9650\u5236`);
+      charge(JSON.stringify(text));
+    };
     function copy(v, depth) {
-      if (++count > 2e4 || depth > 32) throw Error("\u53C2\u6570\u8D85\u8FC7\u9884\u89C8\u7ED3\u6784\u9650\u5236");
+      if (++count > MAX_JSON_VALUES || depth > 32) throw Error("\u53C2\u6570\u8D85\u8FC7\u9884\u89C8\u7ED3\u6784\u9650\u5236");
       if (typeof v === "number" && (!Number.isFinite(v) || Number.isInteger(v) && !Number.isSafeInteger(v))) throw Error("\u6570\u503C\u8D85\u51FA\u5B89\u5168\u8303\u56F4");
-      if (v === null || ["string", "boolean", "number"].includes(typeof v)) return v;
+      if (typeof v === "string") {
+        chargeString(v);
+        return v;
+      }
+      if (v === null || typeof v === "boolean" || typeof v === "number") {
+        charge(JSON.stringify(v));
+        return v;
+      }
       if (!v || typeof v !== "object") throw Error("\u53C2\u6570\u4E0D\u662F JSON \u6570\u636E");
-      if (Array.isArray(v) && v.length > 2e4) throw Error("\u53C2\u6570\u8D85\u8FC7\u9884\u89C8\u7ED3\u6784\u9650\u5236");
+      if (Array.isArray(v) && v.length > MAX_JSON_VALUES) throw Error("\u53C2\u6570\u8D85\u8FC7\u9884\u89C8\u7ED3\u6784\u9650\u5236");
       const keys = Array.isArray(v) ? Array.from({ length: v.length }, (_, i) => String(i)) : Object.keys(v);
-      if (keys.length > 2e4) throw Error("\u53C2\u6570\u8D85\u8FC7\u9884\u89C8\u7ED3\u6784\u9650\u5236");
+      if (keys.length > MAX_JSON_VALUES) throw Error("\u53C2\u6570\u8D85\u8FC7\u9884\u89C8\u7ED3\u6784\u9650\u5236");
+      charge((Array.isArray(v) ? "[]" : "{}") + ",".repeat(Math.max(0, keys.length - 1)));
       const entries = keys.map((k) => {
+        if (!Array.isArray(v)) {
+          chargeString(k);
+          charge(":");
+        }
         const descriptor = Object.getOwnPropertyDescriptor(v, k);
         if (!descriptor || !("value" in descriptor)) throw Error("\u53C2\u6570\u542B\u4E0D\u53EF\u8BFB\u53D6\u7684\u5C5E\u6027");
         return [k, copy(descriptor.value, depth + 1)];
@@ -53,7 +80,7 @@
     }
     return JSON.stringify(copy(value, 0));
   }
-  function readParameter(data, name, location) {
+  function readParameter(data, name, location, maxBytes = MAX_TABLE_CHARS) {
     let raw = ownValue(ownValue(data, location), name);
     if (raw && typeof raw === "object" && ownValue(raw, "type") !== void 0) {
       const type = ownValue(raw, "type");
@@ -63,8 +90,8 @@
     if (typeof raw === "string" && /\{\{#.*?#\}\}/s.test(raw)) return { status: "dynamic", message: `${name} \u542B\u672A\u89E3\u6790\u53D8\u91CF\uFF1B\u65E0\u6CD5\u786E\u8BA4\u5185\u5BB9\u3002` };
     if (raw === void 0 || raw === null || raw === "") return { status: "empty", message: `\u5C1A\u672A\u914D\u7F6E ${name}\u3002` };
     try {
-      if (typeof raw !== "string") raw = serializeParameter(raw);
-      if (raw.length > MAX_TABLE_CHARS) throw Error(`${name} \u8D85\u8FC7\u9884\u89C8\u5927\u5C0F\u9650\u5236`);
+      if (typeof raw !== "string") raw = serializeParameter(raw, maxBytes);
+      if (raw.length > maxBytes || new TextEncoder().encode(raw).length > maxBytes) throw Error(`${name} \u8D85\u8FC7 ${maxBytes / 1024} KiB \u9884\u89C8\u5927\u5C0F\u9650\u5236`);
       return { status: "ready", raw };
     } catch (e) {
       return { status: "error", message: e instanceof Error ? e.message : "\u53C2\u6570\u8BFB\u53D6\u5931\u8D25" };
@@ -77,7 +104,7 @@
     if (provider === BRIAN_JSON_PROVIDER && tool === "evaluate_json_table")
       return { ...base, ...readParameter(data, "table_json", "tool_configurations"), format: "brian-json" };
     if (provider === BRIAN_JSON_PROVIDER && tool === "evaluate_decision") {
-      const bundle = readParameter(data, "definition_bundle_json", "tool_configurations");
+      const bundle = readParameter(data, "definition_bundle_json", "tool_configurations", MAX_DEFINITION_BYTES);
       const ref = readParameter(data, "node_ref", "tool_configurations");
       if (bundle.status !== "ready") return { ...base, ...bundle };
       if (ref.status !== "ready") return { ...base, ...ref };

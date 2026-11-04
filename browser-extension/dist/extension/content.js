@@ -1,19 +1,12 @@
 "use strict";
 (() => {
-  // src/binding.ts
-  var SNAPSHOT_EVENT = "dmn-preview:snapshot:v1";
-  var STOP_EVENT = "dmn-preview:stop:v1";
-  var REFRESH_EVENT = "dmn-preview:refresh:v1";
-  var MAX_TABLE_CHARS = 512 * 1024;
-  function isWorkflowEditorLocation(location) {
-    if (/^\/app\/[^/]+\/workflow\/?$/.test(location.pathname)) return true;
-    return /^\/v2\/app\/[^/]+\/?$/.test(location.pathname) && new URLSearchParams(location.search).get("mode") === "workflow";
-  }
-
   // src/model.ts
   var isRecord = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
   var own = (v, k) => Object.prototype.hasOwnProperty.call(v, k);
   var literal = (v) => JSON.stringify(v);
+  var MAX_JSON_BYTES = 832 * 1024;
+  var MAX_DEFINITION_BYTES = 1024 * 1024;
+  var MAX_JSON_VALUES = Math.ceil(MAX_DEFINITION_BYTES / 2) + 1;
   var binary = ["eq", "ne", "gt", "gte", "lt", "lte", "contains", "not_contains", "all_values", "is_minimum"];
   var tolerance = ["within", "below", "above"];
   var symbols = { eq: "=", ne: "\u2260", gt: ">", gte: "\u2265", lt: "<", lte: "\u2264", contains: "\u5305\u542B", not_contains: "\u4E0D\u5305\u542B", all_values: "\u5168\u90E8\u503C\u7B49\u4E8E", is_minimum: "\u4E3A\u6700\u5C0F\u503C\u4E8E", within: "\u63A5\u8FD1", below: "\u4F4E\u4E8E", above: "\u9AD8\u4E8E" };
@@ -121,13 +114,15 @@
         fail("\u53D8\u91CF\u5F15\u7528\u7ED3\u6784\u9519\u8BEF");
     }
   }
-  function parseJson(value) {
+  function parseJson(value, maxBytes = MAX_JSON_BYTES) {
+    if (maxBytes > MAX_DEFINITION_BYTES || value.length > maxBytes || new TextEncoder().encode(value).length > maxBytes)
+      fail(`JSON \u8D85\u8FC7 ${maxBytes / 1024} KiB`);
     const t = JSON.parse(value);
     uniqueKeys(value);
     let count = 0;
     function walk(v) {
-      if (++count > 2e4)
-        fail("JSON \u503C\u8282\u70B9\u8D85\u8FC7 20,000");
+      if (++count > MAX_JSON_VALUES)
+        fail("JSON \u503C\u8282\u70B9\u8D85\u8FC7\u9884\u89C8\u7ED3\u6784\u9650\u5236");
       if (typeof v === "number" && (!Number.isFinite(v) || Number.isInteger(v) && !Number.isSafeInteger(v)))
         fail("\u6570\u503C\u8D85\u51FA\u5B89\u5168\u8303\u56F4");
       if (typeof v === "string")
@@ -248,14 +243,24 @@
     return isRecord(v) && own(v, column.child) ? { present: true, value: v[column.child] } : { present: false };
   }
 
+  // src/binding.ts
+  var SNAPSHOT_EVENT = "dmn-preview:snapshot:v1";
+  var STOP_EVENT = "dmn-preview:stop:v1";
+  var REFRESH_EVENT = "dmn-preview:refresh:v1";
+  var MAX_TABLE_CHARS = 512 * 1024;
+  function isWorkflowEditorLocation(location) {
+    if (/^\/app\/[^/]+\/workflow\/?$/.test(location.pathname)) return true;
+    return /^\/v2\/app\/[^/]+\/?$/.test(location.pathname) && new URLSearchParams(location.search).get("mode") === "workflow";
+  }
+
   // src/brian.ts
   var operators = { eq: "=", ne: "\u2260", lt: "<", lte: "\u2264", gt: ">", gte: "\u2265", in: "\u5C5E\u4E8E", exists: "\u5B58\u5728", is_null: "\u4E3A null" };
   function requireShape(ok, message) {
     if (!ok) throw Error(message);
   }
-  function object(raw, name) {
-    requireShape(typeof raw === "string" && new TextEncoder().encode(raw).length <= 512 * 1024, `${name} \u7F3A\u5931\u6216\u8D85\u8FC7 512 KiB`);
-    const value = parseJson(raw);
+  function object(raw, name, maxBytes = 512 * 1024) {
+    requireShape(typeof raw === "string" && raw.length <= maxBytes && new TextEncoder().encode(raw).length <= maxBytes, `${name} \u7F3A\u5931\u6216\u8D85\u8FC7 ${maxBytes / 1024} KiB`);
+    const value = parseJson(raw, maxBytes);
     requireShape(isRecord(value), `${name} \u5FC5\u987B\u4E3A JSON \u5BF9\u8C61`);
     return value;
   }
@@ -277,7 +282,7 @@
     const ids = /* @__PURE__ */ new Set();
     const rules = model.rules.map((r) => {
       requireShape(isRecord(r), "\u89C4\u5219\u5FC5\u987B\u4E3A\u5BF9\u8C61");
-      exact(r, service ? ["rule_id", stored && own(r, "when_any") ? "when_any" : "when", "output_template_ref"] : ["id", "when", "output"], "\u89C4\u5219\uFF08\u5185\u8054\u8282\u70B9\u4E0D\u652F\u6301 when_any\uFF09");
+      exact(r, service ? ["rule_id", own(r, "when_any") ? "when_any" : "when", "output_template_ref"] : ["id", "when", "output"], "\u89C4\u5219\uFF08when \u4E0E when_any \u53EA\u80FD\u6709\u4E00\u4E2A\uFF09");
       const rid = service ? r.rule_id : r.id;
       requireShape(typeof rid === "string" && rid.length && !ids.has(rid), "\u89C4\u5219 ID \u7F3A\u5931\u6216\u91CD\u590D");
       ids.add(rid);
@@ -288,9 +293,9 @@
     const matrix = buildMatrix({ id, hit_policy: model.hit_policy, rules });
     model.rules.forEach((r, index) => {
       const rule = r;
-      const any = stored && own(rule, "when_any");
+      const any = service && own(rule, "when_any");
       const groups = any ? rule.when_any : [rule.when];
-      requireShape(Array.isArray(groups) && groups.length > 0 && groups.length <= 32, "when_any \u5FC5\u987B\u5305\u542B 1..32 \u4E2A\u6761\u4EF6\u7EC4");
+      requireShape(Array.isArray(groups) && groups.length > 0 && groups.length <= 128, "when_any \u5FC5\u987B\u5305\u542B 1..128 \u4E2A\u6761\u4EF6\u7EC4");
       const groupedAtoms = groups.map((conditions, groupIndex) => {
         requireShape(Array.isArray(conditions) && conditions.length <= 32 && (!any || conditions.length > 0), "when \u5FC5\u987B\u4E3A\u6700\u591A 32 \u9879\u7684 AND \u6761\u4EF6\u6570\u7EC4");
         const atoms = conditions.map((c, i) => {
@@ -317,6 +322,12 @@
     });
     matrix.note = `${service ? "service-decision-table-v1" : "json-table-v1"} \xB7 \u7248\u672C ${model.version} \xB7 \u7ED3\u6784\u9884\u89C8\uFF0C\u4E0D\u6821\u9A8C\u8FD0\u884C\u6761\u4EF6`;
     if (service) {
+      if (model.rules.some((r) => isRecord(r) && own(r, "when_any") && (!stored || Array.isArray(r.when_any) && r.when_any.length > 32)))
+        matrix.note += " \xB7 \u6B64 when_any \u7ED3\u6784\u9700\u8981\u4E0A\u6E38 v0.5.19 \u6216\u517C\u5BB9\u7248\u672C";
+      if (stored && isRecord(model.parameters)) {
+        const sources = Object.entries(model.parameters).filter(([, parameter]) => isRecord(parameter) && own(parameter, "from_table"));
+        if (sources.length) matrix.note += " \xB7 \u6A21\u578B\u56DE\u6267\u6765\u6E90\u7EA6\u675F\uFF08\u672A\u6C42\u503C\uFF09\uFF1A" + sources.map(([name, parameter]) => `${literal(name)} \u2192 ${literal(parameter.from_table)}`).join("\uFF1B");
+      }
       requireShape(model.on_no_match === "ERROR" || model.on_no_match === "RESULT_TEMPLATE", "\u4E0D\u652F\u6301\u7684 on_no_match");
       matrix.note += ` \xB7 \u65E0\u5339\u914D\uFF1A${model.on_no_match}`;
       if (model.on_no_match === "RESULT_TEMPLATE") {
@@ -328,7 +339,7 @@
   }
   function parseBrian(snapshot) {
     try {
-      const t = object(snapshot.raw, snapshot.format === "brian-json" ? "table_json" : "definition_bundle_json");
+      const t = object(snapshot.raw, snapshot.format === "brian-json" ? "table_json" : "definition_bundle_json", snapshot.format === "brian-json" ? 512 * 1024 : MAX_DEFINITION_BYTES);
       if (snapshot.format === "brian-json") {
         exact(t, ["format", "id", "version", "hit_policy", "rules"], "json-table-v1");
         requireShape(t.format === "json-table-v1" && typeof t.id === "string" && t.id.length, "\u9700\u8981 json-table-v1 \u548C id");
@@ -411,7 +422,7 @@ source: ${literal(model.source)}` };
   }
 
   // src/stored.ts
-  var MAX_IMPORT_BYTES = 832 * 1024;
+  var MAX_IMPORT_BYTES = MAX_JSON_BYTES;
   var schemas = {
     "decision-table/v1": ["dmn-json.decision-table/v1"],
     "decision-set/v1": ["dmn-json.decision-set/v1"],
@@ -574,7 +585,7 @@ source: ${literal(model.source)}` };
 content_sha256 ${digest}
 \u539F\u6587 SHA-256 ${fileHash}
 ${ref.version || ref.digest ? "\u5DF2\u6838\u5BF9\u8282\u70B9\u7248\u672C/\u6458\u8981\u7EA6\u675F" : source === "local" ? "\u8282\u70B9\u672A\u9489\u7248\u672C\uFF1B\u6B64\u5FEB\u7167\u662F\u5426\u4E3A\u7EBF\u4E0A\u6700\u65B0\u7248\u672A\u77E5" : "\u8282\u70B9\u672A\u9489\u7248\u672C\uFF1B\u663E\u793A\u8FD9\u6B21\u67E5\u8BE2\u8FD4\u56DE\u7684\u7248\u672C"} \xB7 ${source === "local" ? "\u6458\u8981\u4E00\u81F4\u4E0D\u8BC1\u660E\u6587\u4EF6\u6765\u6E90\u8EAB\u4EFD \xB7 \u4E0D\u8054\u7F51\u3001\u4E0D\u6267\u884C\u3001\u4E0D\u4FDD\u5B58\u5230\u78C1\u76D8" : "\u6458\u8981\u4E00\u81F4\u4E0D\u4EE3\u66FF\u67E5\u8BE2\u5E94\u7528\u6743\u9650\u5BA1\u67E5 \xB7 \u4EC5\u5728\u5F53\u524D\u9884\u89C8\u5185\u4FDD\u5B58"}`;
-    return { models, document: doc, provenance };
+    return { models, document: doc, provenance: provenance + "\n\u6A21\u578B from_table \u8BA1\u5165\u5185\u5BB9\u6458\u8981\uFF1Bdeclare \u4E0D\u5728 content_sha256 \u5185\u3002\u4EC5\u663E\u793A\u58F0\u660E\u539F\u6587\uFF0C\u672A\u6267\u884C STANDARD \u4FDD\u5B58\u6821\u9A8C\u3002" };
   }
 
   // src/store-node.ts
@@ -1072,7 +1083,7 @@ ${preview.provenance}
       }
     }, receive = function(event) {
       const detail = event.detail;
-      if (typeof detail !== "string" || detail.length > MAX_TABLE_CHARS * 4 + 8192) return;
+      if (typeof detail !== "string" || detail.length > (MAX_DEFINITION_BYTES + MAX_TABLE_CHARS) * 2 + 8192) return;
       let snapshot;
       try {
         snapshot = JSON.parse(detail);
@@ -1080,8 +1091,9 @@ ${preview.provenance}
         return;
       }
       if (!snapshot || !["ready", "empty", "dynamic", "unsupported", "idle", "error"].includes(snapshot.status)) return;
-      if (snapshot.raw !== void 0 && (typeof snapshot.raw !== "string" || snapshot.raw.length > MAX_TABLE_CHARS)) return;
-      if (snapshot.auxiliary !== void 0 && (typeof snapshot.auxiliary !== "string" || snapshot.auxiliary.length > MAX_TABLE_CHARS)) return;
+      const rawLimit = snapshot.format === "brian-decision" ? MAX_DEFINITION_BYTES : MAX_TABLE_CHARS;
+      if (snapshot.raw !== void 0 && (typeof snapshot.raw !== "string" || snapshot.raw.length > rawLimit || new TextEncoder().encode(snapshot.raw).length > rawLimit)) return;
+      if (snapshot.auxiliary !== void 0 && (typeof snapshot.auxiliary !== "string" || snapshot.auxiliary.length > MAX_TABLE_CHARS || new TextEncoder().encode(snapshot.auxiliary).length > MAX_TABLE_CHARS)) return;
       if (snapshot.format !== void 0 && !["brian-json", "brian-decision", "dmn-xml"].includes(snapshot.format)) return;
       if (snapshot.storage !== void 0 && (!snapshot.storage || typeof snapshot.storage !== "object" || typeof snapshot.storage.table !== "string" || typeof snapshot.storage.format !== "string" || Object.entries(snapshot.storage).some(([k, v]) => !["table", "format", "version", "digest"].includes(k) || typeof v !== "string" || v.length > 1024))) return;
       if (snapshot.storeNode !== void 0 && (!snapshot.storeNode || typeof snapshot.storeNode !== "object" || Object.entries(snapshot.storeNode).some(([k, v]) => !["table", "version", "op"].includes(k) || typeof v !== "string" || v.length > 1024))) return;
