@@ -6,3 +6,6 @@ export * from '../src/xml'
 export * from '../src/stored'
 export * from '../src/reader-app'
 export * from '../src/store-node'
+
+export * from '../src/readable'
+export * from '../src/panel-resize'

@@ -10,6 +10,7 @@ function setup(count = 2) {
  w.requestAnimationFrame=fn=>{callbacks.set(++frame,fn);return frame};w.cancelAnimationFrame=id=>callbacks.delete(id)
  const snapshot={status:'ready',nodeId:'one',title:'Synthetic',raw:JSON.stringify({id:'synthetic',hit_policy:'FIRST',rules:Array.from({length:count},(_,i)=>({id:'r'+i,when:{eq:['sensor',i]},output:{result:'ok'}}))})}
  renderSnapshot(c,snapshot)
+ ;[...c.querySelectorAll('button')].find(b=>b.textContent==='矩阵视图').click()
  const controls=()=>[...c.querySelectorAll('[role=separator]')]
  const prepare=h=>{let capture;h.setPointerCapture=id=>{capture=id};h.hasPointerCapture=id=>capture===id;h.releasePointerCapture=()=>{capture=undefined};return h}
  const pointer=(h,type,x,extra={})=>{const e=new w.MouseEvent(type,{bubbles:true,cancelable:true,clientX:x,button:0,...extra});Object.defineProperty(e,'pointerId',{value:1});Object.defineProperty(e,'isPrimary',{value:true});h.dispatchEvent(e)}
@@ -41,7 +42,7 @@ test('paging retains widths; switching nodes starts a new table; cancel removes 
  const s=setup(51);s.key(s.controls()[1],'ArrowRight');[...s.c.querySelectorAll('button')].find(b=>b.textContent==='下一页').click()
  assert.equal(s.c.querySelectorAll('col')[1].style.width,'190px');assert.equal(s.c.querySelectorAll('tbody tr').length,1)
  const h=s.prepare(s.controls()[1]);s.pointer(h,'pointerdown',10);s.pointer(h,'pointermove',50);assert.equal(s.callbacks.size,1)
- renderSnapshot(s.c,{...s.snapshot,nodeId:'two'});assert.equal(s.callbacks.size,0);assert.equal(s.c.querySelectorAll('col')[1].style.width,'180px')
+ renderSnapshot(s.c,{...s.snapshot,nodeId:'two'});[...s.c.querySelectorAll('button')].find(b=>b.textContent==='矩阵视图').click();assert.equal(s.callbacks.size,0);assert.equal(s.c.querySelectorAll('col')[1].style.width,'180px')
  const h2=s.prepare(s.controls()[1]);s.pointer(h2,'pointerdown',10);cancelPreview(s.c);assert(!s.c.querySelector('table').classList.contains('dmnp-resizing'));s.dom.window.close()
 })
 test('non-primary button cannot start a drag; pointer cancellation restores starting width',()=>{

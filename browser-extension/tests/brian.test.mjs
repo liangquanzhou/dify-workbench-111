@@ -111,7 +111,7 @@ test('XML selects exact decision, renders FEEL text and rejects wrong ids / DTD 
   const d = document()
   const s = extractTable(data('evaluate_dmn', {}, { provider_id: BRIAN_XML_PROVIDER, tool_parameters: { dmn_xml: form(read('locate-problem.dmn')), decision_id: form('locate_problem') } }), 'XML')
   const p = parseXml(s, d); assert.equal(p.kind, 'ready', p.message); assert.equal(p.matrix.rows.length, 3)
-  const c = d.createElement('div'); renderSnapshot(c, s); assert.match(c.textContent, /CONFIRMED_ABSENT/); assert.doesNotMatch(c.textContent, /identify_order_r1/)
+  const c = d.createElement('div'); renderSnapshot(c, s); assert.match(c.textContent, /CONFIRMED_ABSENT/); assert.doesNotMatch(c.querySelector('table').textContent, /identify_order_r1/); assert([...c.querySelectorAll('pre')].some(e => e.textContent === s.raw))
   for (const patch of [{ auxiliary: 'missing' }, { raw: '<!DOCTYPE definitions []>' + s.raw }, { raw: s.raw.replace('<inputEntry id="x7"><text>&quot;CONFIRMED_ABSENT&quot;</text></inputEntry>', '') }]) assert.equal(parseXml({ ...s, ...patch }, d).kind, 'error')
 })
 test('current DOM selection switches from Brian table to decision bundle and then stored reference', () => {

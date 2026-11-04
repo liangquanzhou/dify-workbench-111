@@ -1,5 +1,5 @@
 import { buildMatrix, isRecord, literal, own, parseJson, MAX_DEFINITION_BYTES } from './model'
-import type { Json, Matrix, Rule } from './model'
+import type { Json, Matrix, Rule, ConditionTree } from './model'
 import type { Snapshot, StoredReference } from './binding'
 
 const operators: Record<string, string> = { eq: '=', ne: '≠', lt: '<', lte: '≤', gt: '>', gte: '≥', in: '属于', exists: '存在', is_null: '为 null' }
@@ -63,11 +63,15 @@ export function matrixFor(model: Record<string, Json>, id: string, service: bool
         // Bracket notation preserves the difference between ["a.b"] and ["a","b"].
         const field = '$' + c.path.map(k => `[${literal(k)}]`).join('')
         if (!matrix.fields.includes(field)) matrix.fields.push(field)
-        return { id: (any ? `组${groupIndex + 1}.` : '') + String.fromCharCode(65 + i % 26) + (i >= 26 ? String(Math.floor(i / 26)) : ''), field, label: `${operators[c.op]} ${literal(c.value)}` }
+        return { id: (any ? `组${groupIndex + 1}.` : '') + String.fromCharCode(65 + i % 26) + (i >= 26 ? String(Math.floor(i / 26)) : ''), field, path: c.path as string[], operator: c.op, value: c.value, label: `${operators[c.op]} ${literal(c.value)}` }
       })
       return atoms
     })
     matrix.rows[index].atoms = groupedAtoms.flat()
+    const branches: ConditionTree[] = groupedAtoms.map(atoms => ({kind: 'all', children: atoms.map(atom => ({kind: 'predicate', atom}))}))
+    matrix.rows[index].tree = any ? {kind: 'any', children: branches} : branches[0]
+    matrix.rows[index].sourceRule = rule
+    if (service) { matrix.rows[index].templateRef = rule.output_template_ref as string; matrix.rows[index].template = (templates as Record<string, Json>)[rule.output_template_ref as string] }
     matrix.rows[index].logic = groupedAtoms.map(atoms => atoms.length ? `(${atoms.map(a => a.id).join(' 且 ')})` : '始终成立').join(' 或 ')
     matrix.rows[index].fullLogic = groupedAtoms.map(atoms => atoms.length ? `(${atoms.map(a => `${a.field} ${a.label}`).join(' 且 ')})` : '始终成立').join(' 或 ')
   })

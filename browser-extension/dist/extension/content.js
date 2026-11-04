@@ -1,5 +1,139 @@
 "use strict";
 (() => {
+  // src/panel-resize.ts
+  function resizePanel(root, grow) {
+    const win = root.ownerDocument.defaultView;
+    const gap = 8;
+    let expanded = false, cancelDrag;
+    const bounds = () => ({ width: Math.max(1, win.innerWidth - gap * 2), height: Math.max(1, win.innerHeight - gap * 2) });
+    const clamp = (r) => {
+      const b = bounds(), width = Math.min(b.width, Math.max(Math.min(420, b.width), r.width)), height = Math.min(b.height, Math.max(Math.min(220, b.height), r.height));
+      return { width, height, x: Math.max(gap, Math.min(r.x, win.innerWidth - gap - width)), y: Math.max(gap, Math.min(r.y, win.innerHeight - gap - height)) };
+    };
+    const initial = root.getBoundingClientRect();
+    let rect = clamp({ x: initial.x || 14, y: Math.max(gap, win.innerHeight - Math.min(580, win.innerHeight * 0.6) - 14), width: initial.width || win.innerWidth - 490, height: Math.min(580, win.innerHeight * 0.6) });
+    let normal = { ...rect };
+    const apply = (r) => {
+      rect = clamp(r);
+      Object.assign(root.style, { left: `${rect.x}px`, top: `${rect.y}px`, bottom: "auto", width: `${rect.width}px`, height: `${rect.height}px`, minWidth: "0", maxHeight: "none" });
+      root.style.setProperty("--dmnp-panel-height", `${rect.height}px`);
+      root.classList.toggle("dmnp-expanded", expanded);
+      grow.textContent = expanded ? "\u8FD8\u539F" : "\u5C55\u5F00";
+    };
+    const full = () => ({ x: gap, y: gap, ...bounds() });
+    const move = (start, direction, dx, dy) => {
+      const b = bounds(), minW = Math.min(420, b.width), minH = Math.min(220, b.height);
+      let left = start.x, right = start.x + start.width, top = start.y, bottom = start.y + start.height;
+      if (direction.includes("e")) right = Math.min(win.innerWidth - gap, Math.max(left + minW, right + dx));
+      if (direction.includes("w")) left = Math.max(gap, Math.min(right - minW, left + dx));
+      if (direction.includes("s")) bottom = Math.min(win.innerHeight - gap, Math.max(top + minH, bottom + dy));
+      if (direction.includes("n")) top = Math.max(gap, Math.min(bottom - minH, top + dy));
+      return { x: left, y: top, width: right - left, height: bottom - top };
+    };
+    const toggle = () => {
+      cancelDrag?.();
+      if (!expanded) normal = { ...rect };
+      expanded = !expanded;
+      apply(expanded ? full() : normal);
+    };
+    grow.addEventListener("click", toggle);
+    const handles = [];
+    for (const [direction, label] of Object.entries({ n: "\u4E0A", s: "\u4E0B", e: "\u53F3", w: "\u5DE6", ne: "\u53F3\u4E0A", nw: "\u5DE6\u4E0A", se: "\u53F3\u4E0B", sw: "\u5DE6\u4E0B" })) {
+      const handle = root.ownerDocument.createElement("div");
+      handle.className = `dmnp-panel-resize dmnp-edge-${direction}`;
+      handle.tabIndex = 0;
+      handle.setAttribute("role", "button");
+      handle.setAttribute("aria-label", `\u8C03\u6574\u9884\u89C8\u7A97\u53E3${label}\u8FB9\u754C`);
+      handle.title = "\u62D6\u52A8\u8C03\u6574\u7A97\u53E3\uFF1B\u65B9\u5411\u952E\u5FAE\u8C03\uFF1BEsc \u53D6\u6D88\u62D6\u62FD";
+      handle.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0 || event.isPrimary === false) return;
+        event.preventDefault();
+        event.stopPropagation();
+        cancelDrag?.();
+        const start = { ...rect }, wasExpanded = expanded, oldNormal = { ...normal }, x = event.clientX, y = event.clientY, pointer = event.pointerId;
+        let pending = start, frame = 0;
+        expanded = false;
+        apply(rect);
+        root.classList.add("dmnp-panel-dragging");
+        handle.setPointerCapture?.(pointer);
+        const flush = () => {
+          frame = 0;
+          apply(pending);
+        };
+        const pointermove = (e) => {
+          if (e.pointerId !== pointer) return;
+          e.preventDefault();
+          pending = move(start, direction, e.clientX - x, e.clientY - y);
+          if (!frame) frame = win.requestAnimationFrame(flush);
+        };
+        const finish = (restore) => {
+          if (frame) win.cancelAnimationFrame(frame);
+          win.removeEventListener("pointermove", pointermove);
+          win.removeEventListener("pointerup", pointerup);
+          win.removeEventListener("pointercancel", pointercancel);
+          win.removeEventListener("keydown", keydown);
+          handle.removeEventListener("lostpointercapture", pointercancel);
+          if (handle.hasPointerCapture?.(pointer)) handle.releasePointerCapture(pointer);
+          root.classList.remove("dmnp-panel-dragging");
+          cancelDrag = void 0;
+          if (restore) {
+            expanded = wasExpanded;
+            normal = oldNormal;
+            apply(start);
+          } else {
+            apply(pending);
+            normal = { ...rect };
+          }
+        };
+        const pointerup = (e) => {
+          if (e.pointerId === pointer) {
+            pending = move(start, direction, e.clientX - x, e.clientY - y);
+            finish(false);
+          }
+        };
+        const pointercancel = () => finish(true);
+        const keydown = (e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            finish(true);
+          }
+        };
+        win.addEventListener("pointermove", pointermove);
+        win.addEventListener("pointerup", pointerup);
+        win.addEventListener("pointercancel", pointercancel);
+        win.addEventListener("keydown", keydown);
+        handle.addEventListener("lostpointercapture", pointercancel);
+        cancelDrag = () => finish(true);
+      });
+      handle.addEventListener("keydown", (event) => {
+        const delta = { ArrowLeft: [-10, 0], ArrowRight: [10, 0], ArrowUp: [0, -10], ArrowDown: [0, 10] };
+        if (!delta[event.key]) return;
+        event.preventDefault();
+        event.stopPropagation();
+        cancelDrag?.();
+        const [dx, dy] = delta[event.key];
+        expanded = false;
+        apply(move(rect, direction, dx * (event.shiftKey ? 5 : 1), dy * (event.shiftKey ? 5 : 1)));
+        normal = { ...rect };
+      });
+      root.append(handle);
+      handles.push(handle);
+    }
+    const viewport = () => {
+      cancelDrag?.();
+      apply(expanded ? full() : rect);
+      if (!expanded) normal = { ...rect };
+    };
+    win.addEventListener("resize", viewport);
+    apply(rect);
+    return () => {
+      cancelDrag?.();
+      win.removeEventListener("resize", viewport);
+      grow.removeEventListener("click", toggle);
+      handles.forEach((handle) => handle.remove());
+    };
+  }
+
   // src/model.ts
   var isRecord = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
   var own = (v, k) => Object.prototype.hasOwnProperty.call(v, k);
@@ -187,13 +321,13 @@
   }
   function buildMatrix(table) {
     const fields = [];
-    const outputs = [];
+    const outputs2 = [];
     const outputKeys = /* @__PURE__ */ new Set();
     const addOutput = (parent, child) => {
       const key = JSON.stringify([parent, child ?? null]);
       if (!outputKeys.has(key)) {
         outputKeys.add(key);
-        outputs.push({ key, parent, child, label: child !== void 0 ? `$[${JSON.stringify(parent)}][${JSON.stringify(child)}]` : `$[${JSON.stringify(parent)}]` });
+        outputs2.push({ key, parent, child, label: child !== void 0 ? `$[${JSON.stringify(parent)}][${JSON.stringify(child)}]` : `$[${JSON.stringify(parent)}]` });
       }
     };
     const rows = table.rules.map((rule) => {
@@ -227,9 +361,15 @@
         else
           addOutput(parent);
       });
-      return { rule, atoms, logic, fullLogic };
+      let cursor = 0;
+      const tree = (v) => {
+        if (typeof v === "boolean") return { kind: "constant", value: v };
+        const [op, arg] = Object.entries(v)[0];
+        return op === "all" || op === "any" ? { kind: op, children: arg.map(tree) } : { kind: "predicate", atom: atoms[cursor++] };
+      };
+      return { rule, atoms, logic, fullLogic, tree: tree(rule.when), sourceRule: rule };
     });
-    return { table, fields, outputs, rows };
+    return { table, fields, outputs: outputs2, rows };
   }
   function outputValue(rule, column) {
     if (!own(rule, column.parent))
@@ -251,6 +391,130 @@
   function isWorkflowEditorLocation(location) {
     if (/^\/app\/[^/]+\/workflow\/?$/.test(location.pathname)) return true;
     return /^\/v2\/app\/[^/]+\/?$/.test(location.pathname) && new URLSearchParams(location.search).get("mode") === "workflow";
+  }
+
+  // src/readable.ts
+  var node = (d, tag, text = "", cls = "") => {
+    const e = d.createElement(tag);
+    e.textContent = text;
+    e.className = cls;
+    return e;
+  };
+  function rawDetails(d, title, text) {
+    const details = d.createElement("details");
+    details.className = "dmnp-raw";
+    details.append(node(d, "summary", title), node(d, "pre", text));
+    return details;
+  }
+  function jsonValue(d, value, depth = 0) {
+    if (depth === 0 && value !== null && typeof value === "object" && JSON.stringify(value).length > 16e3) return rawDetails(d, "\u5927\u578B\u7ED3\u6784\uFF08\u5B8C\u6574 JSON\uFF09", JSON.stringify(value, null, 2));
+    if (value === null || typeof value !== "object") {
+      const type = value === null ? "null" : typeof value === "string" ? "\u5B57\u7B26\u4E32" : typeof value === "boolean" ? "\u5E03\u5C14\u503C" : "\u6570\u503C";
+      const e = node(d, "span", "", "dmnp-value");
+      e.append(node(d, "small", type), node(d, "code", literal(value)));
+      return typeof value === "string" && value.length > 180 ? rawDetails(d, `\u5B8C\u6574\u5B57\u7B26\u4E32 \xB7 ${value.length} \u5B57\u7B26`, literal(value)) : e;
+    }
+    const entries = Array.isArray(value) ? value.map((v, i) => [String(i), v]) : Object.entries(value);
+    if (!entries.length) return node(d, "code", Array.isArray(value) ? "[]\uFF08\u7A7A\u6570\u7EC4\uFF09" : "{}\uFF08\u7A7A\u5BF9\u8C61\uFF09");
+    if (depth >= 4 || entries.length > 24) return rawDetails(d, `${Array.isArray(value) ? "\u6570\u7EC4" : "\u5BF9\u8C61"} \xB7 ${entries.length} \u9879\uFF08\u5B8C\u6574 JSON\uFF09`, JSON.stringify(value, null, 2));
+    const list = node(d, "dl", "", "dmnp-json");
+    for (const [key, child] of entries) {
+      const dd = node(d, "dd");
+      dd.append(jsonValue(d, child, depth + 1));
+      list.append(node(d, "dt", Array.isArray(value) ? `\u7B2C ${Number(key) + 1} \u9879` : key), dd);
+    }
+    return list;
+  }
+  var operators = { eq: "\u7B49\u4E8E", ne: "\u4E0D\u7B49\u4E8E", lt: "\u5C0F\u4E8E", lte: "\u5C0F\u4E8E\u6216\u7B49\u4E8E", gt: "\u5927\u4E8E", gte: "\u5927\u4E8E\u6216\u7B49\u4E8E", in: "\u7B49\u4E8E\u4EE5\u4E0B\u5019\u9009\u503C\u4E2D\u7684\u4EFB\u4E00\u9879" };
+  function conditions(d, tree) {
+    if (tree.kind === "constant") return node(d, "p", tree.value ? "\u65E0\u6761\u4EF6\uFF08\u59CB\u7EC8\u6210\u7ACB\uFF09" : "\u59CB\u7EC8\u4E0D\u6210\u7ACB");
+    if (tree.kind === "predicate") {
+      const a = tree.atom, e = node(d, "div", "", "dmnp-predicate");
+      const field = node(d, "div", "", "dmnp-field");
+      if (a.path) {
+        for (const [i, part] of a.path.entries()) {
+          if (i) field.append(node(d, "span", " \u203A ", "dmnp-path-separator"));
+          field.append(node(d, "code", literal(part)));
+        }
+        field.title = a.field;
+      } else field.append(node(d, "span", `\u6761\u4EF6 \xB7 ${literal(a.field)}`));
+      e.append(field);
+      if (a.feel) e.append(node(d, "small", "FEEL \u8868\u8FBE\u5F0F\u539F\u6587"), node(d, "pre", a.label));
+      else if (a.operator) {
+        const unary = a.operator === "exists" ? a.value ? "\u8DEF\u5F84\u5B58\u5728" : "\u8DEF\u5F84\u4E0D\u5B58\u5728" : a.operator === "is_null" ? a.value ? "\u4E3A null" : "\u4E0D\u4E3A null" : void 0;
+        e.append(node(d, "strong", unary ?? operators[a.operator] ?? a.operator));
+        if (!unary) e.append(jsonValue(d, a.value));
+        e.append(node(d, "small", `${a.id} \xB7 ${a.operator}${unary ? `: ${literal(a.value)}` : ""}`, "dmnp-atom-id"));
+      } else e.append(node(d, "span", a.label), node(d, "small", ` \xB7 ${a.id}`, "dmnp-atom-id"));
+      return e;
+    }
+    if (!tree.children.length) return node(d, "p", tree.kind === "all" ? "\u7A7A AND \u7EC4\uFF1A\u59CB\u7EC8\u6210\u7ACB" : "\u7A7A OR \u7EC4\uFF1A\u59CB\u7EC8\u4E0D\u6210\u7ACB");
+    const group = node(d, "section", "", `dmnp-condition-group dmnp-${tree.kind}`);
+    const title = `${tree.kind === "all" ? "\u540C\u65F6\u6EE1\u8DB3\uFF08AND\uFF09" : "\u6EE1\u8DB3\u4EFB\u610F\u4E00\u9879\uFF0F\u7EC4\uFF08OR\uFF09"} \xB7 ${tree.children.length} \u9879`;
+    const list = node(d, "div");
+    const fill = () => {
+      if (!list.childNodes.length) tree.children.forEach((child) => list.append(conditions(d, child)));
+    };
+    if (tree.children.length > 6) {
+      const details = d.createElement("details");
+      details.append(node(d, "summary", title + " \xB7 \u5C55\u5F00\u5168\u90E8"), list);
+      details.addEventListener("toggle", () => {
+        if (details.open) fill();
+      });
+      group.append(details);
+    } else {
+      group.append(node(d, "div", title, "dmnp-group-label"), list);
+      fill();
+    }
+    return group;
+  }
+  function templateValue(d, value) {
+    if (isRecord(value) && Object.keys(value).length === 1 && Object.hasOwn(value, "literal")) {
+      const e = node(d, "div");
+      e.append(node(d, "small", "\u56FA\u5B9A\u503C\uFF08literal\uFF09"), jsonValue(d, value.literal));
+      return e;
+    }
+    if (isRecord(value) && Object.hasOwn(value, "from")) {
+      const e = node(d, "div", "", "dmnp-reference");
+      e.append(node(d, "strong", "\u8FD0\u884C\u65F6\u5F15\u7528\uFF08\u5C1A\u672A\u89E3\u6790\uFF09"), jsonValue(d, value));
+      return e;
+    }
+    return jsonValue(d, value);
+  }
+  function outputs(d, row) {
+    const e = node(d, "div", "", "dmnp-readable-output");
+    if (row.record !== void 0) {
+      e.append(jsonValue(d, row.record));
+      return e;
+    }
+    if (row.templateRef !== void 0 && isRecord(row.template)) {
+      e.append(node(d, "div", `\u6A21\u677F\uFF1A${row.templateRef}`, "dmnp-template-ref"), node(d, "small", "\u8F93\u51FA\u58F0\u660E \xB7 \u672A\u6C42\u503C\uFF0C\u52A8\u4F5C\u672A\u6267\u884C"));
+      for (const [key, value] of Object.entries(row.template)) {
+        const title = { state: "\u72B6\u6001\uFF08state\uFF09", data: "\u6570\u636E\uFF08data\uFF09", actions: "\u52A8\u4F5C\u58F0\u660E\uFF08actions\uFF09" }[key] ?? key;
+        const section = node(d, "section");
+        section.append(node(d, "strong", title));
+        if (key === "data" && isRecord(value)) {
+          for (const [name, v] of Object.entries(value)) {
+            const item = node(d, "div", "", "dmnp-output-item");
+            item.append(node(d, "div", name, "dmnp-output-key"), templateValue(d, v));
+            section.append(item);
+          }
+          if (!Object.keys(value).length) section.append(jsonValue(d, value));
+        } else section.append(jsonValue(d, value));
+        e.append(section);
+      }
+    } else {
+      if (row.feel) e.append(node(d, "small", "FEEL \u8F93\u51FA\u8868\u8FBE\u5F0F\u539F\u6587 \xB7 \u672A\u6C42\u503C"));
+      const values = Object.fromEntries(Object.entries(row.rule).filter(([k]) => k !== "id" && k !== "when"));
+      if (row.feel) {
+        for (const [key, value] of Object.entries(isRecord(values.output) ? values.output : values)) {
+          const section = node(d, "section");
+          section.append(node(d, "strong", key), node(d, "pre", typeof value === "string" ? value : JSON.stringify(value)));
+          e.append(section);
+        }
+      } else e.append(Object.keys(values).length ? jsonValue(d, values) : node(d, "span", "\u672A\u5B9A\u4E49\u8F93\u51FA"));
+    }
+    return e;
   }
 
   // src/column-resize.ts
@@ -380,7 +644,7 @@
   }
 
   // src/brian.ts
-  var operators = { eq: "=", ne: "\u2260", lt: "<", lte: "\u2264", gt: ">", gte: "\u2265", in: "\u5C5E\u4E8E", exists: "\u5B58\u5728", is_null: "\u4E3A null" };
+  var operators2 = { eq: "=", ne: "\u2260", lt: "<", lte: "\u2264", gt: ">", gte: "\u2265", in: "\u5C5E\u4E8E", exists: "\u5B58\u5728", is_null: "\u4E3A null" };
   function requireShape(ok, message) {
     if (!ok) throw Error(message);
   }
@@ -422,13 +686,13 @@
       const any = service && own(rule, "when_any");
       const groups = any ? rule.when_any : [rule.when];
       requireShape(Array.isArray(groups) && groups.length > 0 && groups.length <= 128, "when_any \u5FC5\u987B\u5305\u542B 1..128 \u4E2A\u6761\u4EF6\u7EC4");
-      const groupedAtoms = groups.map((conditions, groupIndex) => {
-        requireShape(Array.isArray(conditions) && conditions.length <= 32 && (!any || conditions.length > 0), "when \u5FC5\u987B\u4E3A\u6700\u591A 32 \u9879\u7684 AND \u6761\u4EF6\u6570\u7EC4");
-        const atoms = conditions.map((c, i) => {
+      const groupedAtoms = groups.map((conditions2, groupIndex) => {
+        requireShape(Array.isArray(conditions2) && conditions2.length <= 32 && (!any || conditions2.length > 0), "when \u5FC5\u987B\u4E3A\u6700\u591A 32 \u9879\u7684 AND \u6761\u4EF6\u6570\u7EC4");
+        const atoms = conditions2.map((c, i) => {
           requireShape(isRecord(c), "\u6761\u4EF6\u5FC5\u987B\u4E3A\u5BF9\u8C61");
           exact(c, ["path", "op", "value"], "\u6761\u4EF6");
           requireShape(Array.isArray(c.path) && c.path.length > 0 && c.path.length <= 16 && c.path.every((x) => typeof x === "string" && x.length > 0), "\u6761\u4EF6 path \u5FC5\u987B\u4E3A\u5B57\u7B26\u4E32\u8DEF\u5F84\u6570\u7EC4");
-          requireShape(typeof c.op === "string" && own(operators, c.op), `\u4E0D\u652F\u6301\u7684\u6761\u4EF6\u7B97\u5B50\uFF1A${c.op}`);
+          requireShape(typeof c.op === "string" && own(operators2, c.op), `\u4E0D\u652F\u6301\u7684\u6761\u4EF6\u7B97\u5B50\uFF1A${c.op}`);
           if (c.op === "exists" || c.op === "is_null") requireShape(typeof c.value === "boolean", "exists/is_null \u9700\u8981\u5E03\u5C14\u503C");
           if (c.op === "in") requireShape(Array.isArray(c.value) && c.value.length <= 128, "in \u9700\u8981\u6700\u591A 128 \u9879\u7684\u6570\u7EC4");
           if (["lt", "lte", "gt", "gte"].includes(c.op)) requireShape(typeof c.value === "number" || typeof c.value === "string", "\u6BD4\u8F83\u503C\u5FC5\u987B\u4E3A\u6570\u5B57\u6216\u5B57\u7B26\u4E32");
@@ -438,11 +702,18 @@
           else if (service) requireShape(c.path.length >= 3 && (!stored || c.path.length === 3) && c.path[0] === "parameters" && typeof c.path[1] === "string" && isRecord(model.parameters) && own(model.parameters, c.path[1]) && ["value", "quality"].includes(String(c.path[2])) && (c.path[2] !== "quality" || c.path.length === 3), "\u6761\u4EF6\u5F15\u7528\u4E86\u672A\u58F0\u660E\u53C2\u6570\u6216\u4E0D\u652F\u6301\u7684\u8DEF\u5F84");
           const field = "$" + c.path.map((k) => `[${literal(k)}]`).join("");
           if (!matrix.fields.includes(field)) matrix.fields.push(field);
-          return { id: (any ? `\u7EC4${groupIndex + 1}.` : "") + String.fromCharCode(65 + i % 26) + (i >= 26 ? String(Math.floor(i / 26)) : ""), field, label: `${operators[c.op]} ${literal(c.value)}` };
+          return { id: (any ? `\u7EC4${groupIndex + 1}.` : "") + String.fromCharCode(65 + i % 26) + (i >= 26 ? String(Math.floor(i / 26)) : ""), field, path: c.path, operator: c.op, value: c.value, label: `${operators2[c.op]} ${literal(c.value)}` };
         });
         return atoms;
       });
       matrix.rows[index].atoms = groupedAtoms.flat();
+      const branches = groupedAtoms.map((atoms) => ({ kind: "all", children: atoms.map((atom) => ({ kind: "predicate", atom })) }));
+      matrix.rows[index].tree = any ? { kind: "any", children: branches } : branches[0];
+      matrix.rows[index].sourceRule = rule;
+      if (service) {
+        matrix.rows[index].templateRef = rule.output_template_ref;
+        matrix.rows[index].template = templates[rule.output_template_ref];
+      }
       matrix.rows[index].logic = groupedAtoms.map((atoms) => atoms.length ? `(${atoms.map((a) => a.id).join(" \u4E14 ")})` : "\u59CB\u7EC8\u6210\u7ACB").join(" \u6216 ");
       matrix.rows[index].fullLogic = groupedAtoms.map((atoms) => atoms.length ? `(${atoms.map((a) => `${a.field} ${a.label}`).join(" \u4E14 ")})` : "\u59CB\u7EC8\u6210\u7ACB").join(" \u6216 ");
     });
@@ -477,14 +748,14 @@
       const phase = one(workflow.phases, "phase_id", ref.phase_id);
       const step = one(phase.steps, "step_id", ref.step_id);
       requireShape(isRecord(step.graph), "step.graph \u7F3A\u5931");
-      const node = one(step.graph.nodes, "node_id", ref.node_id);
-      requireShape(node.kind === "DECISION" && typeof node.model_ref === "string" && isRecord(t.models) && own(t.models, node.model_ref), "\u76EE\u6807\u8282\u70B9\u4E0D\u662F DECISION \u6216 model_ref \u4E0D\u5B58\u5728");
-      const model = t.models[node.model_ref];
+      const node2 = one(step.graph.nodes, "node_id", ref.node_id);
+      requireShape(node2.kind === "DECISION" && typeof node2.model_ref === "string" && isRecord(t.models) && own(t.models, node2.model_ref), "\u76EE\u6807\u8282\u70B9\u4E0D\u662F DECISION \u6216 model_ref \u4E0D\u5B58\u5728");
+      const model = t.models[node2.model_ref];
       requireShape(isRecord(model), "\u6A21\u578B\u4E0D\u662F\u5BF9\u8C61");
-      if (own(model, "source")) return { kind: "unsupported", storage: isRecord(model.source) && model.source.kind === "PLUGIN_STORAGE" && typeof model.source.table === "string" && typeof model.source.format === "string" ? { table: model.source.table, format: model.source.format } : void 0, message: `\u6A21\u578B ${node.model_ref} \u5F15\u7528\u4E86\u5916\u90E8\u6216\u63D2\u4EF6\u5B58\u50A8\u5185\u5BB9\uFF0C\u5C1A\u672A\u8BFB\u53D6\u8868\u4F53\u3002
+      if (own(model, "source")) return { kind: "unsupported", storage: isRecord(model.source) && model.source.kind === "PLUGIN_STORAGE" && typeof model.source.table === "string" && typeof model.source.format === "string" ? { table: model.source.table, format: model.source.format } : void 0, message: `\u6A21\u578B ${node2.model_ref} \u5F15\u7528\u4E86\u5916\u90E8\u6216\u63D2\u4EF6\u5B58\u50A8\u5185\u5BB9\uFF0C\u5C1A\u672A\u8BFB\u53D6\u8868\u4F53\u3002
 source: ${literal(model.source)}` };
       requireShape(model.profile === "service-decision-table-v1", "\u4E0D\u652F\u6301\u7684\u6A21\u578B profile");
-      return { kind: "ready", matrix: matrixFor(model, node.model_ref, true) };
+      return { kind: "ready", matrix: matrixFor(model, node2.model_ref, true) };
     } catch (e) {
       return { kind: "error", message: e instanceof Error ? e.message : "\u65E0\u6CD5\u8BFB\u53D6 Brian \u51B3\u7B56\u8868" };
     }
@@ -511,9 +782,9 @@ source: ${literal(model.source)}` };
       const policy = table.getAttribute("hitPolicy") || "UNIQUE";
       if (!["UNIQUE", "FIRST", "COLLECT", "ANY", "PRIORITY", "RULE ORDER", "OUTPUT ORDER"].includes(policy)) throw Error("\u4E0D\u652F\u6301\u7684 DMN \u547D\u4E2D\u7B56\u7565");
       const inputs = children(table, "input");
-      const outputs = children(table, "output");
+      const outputs2 = children(table, "output");
       const rules = children(table, "rule");
-      if (rules.length > 1e3 || inputs.length + outputs.length > 126) throw Error("DMN \u8868\u683C\u8D85\u8FC7\u9884\u89C8\u9650\u5236");
+      if (rules.length > 1e3 || inputs.length + outputs2.length > 126) throw Error("DMN \u8868\u683C\u8D85\u8FC7\u9884\u89C8\u9650\u5236");
       const fields = inputs.map((e, i) => `${i + 1}. ${only(only(e, "inputExpression"), "text").textContent || ""}`);
       const ids = /* @__PURE__ */ new Set();
       const normalized = rules.map((r, i) => {
@@ -521,20 +792,23 @@ source: ${literal(model.source)}` };
         if (ids.has(id)) throw Error("DMN \u89C4\u5219 ID \u91CD\u590D");
         ids.add(id);
         const entries = children(r, "outputEntry");
-        if (entries.length !== outputs.length || children(r, "inputEntry").length !== inputs.length) throw Error("DMN \u6761\u4EF6\u6216\u8F93\u51FA\u5355\u5143\u683C\u6570\u4E0D\u5339\u914D");
-        const output = Object.fromEntries(entries.map((entry, j) => [`${j + 1}. ${outputs[j].getAttribute("name") || outputs[j].getAttribute("label") || "\u8F93\u51FA"}`, only(entry, "text").textContent || ""]));
+        if (entries.length !== outputs2.length || children(r, "inputEntry").length !== inputs.length) throw Error("DMN \u6761\u4EF6\u6216\u8F93\u51FA\u5355\u5143\u683C\u6570\u4E0D\u5339\u914D");
+        const output = Object.fromEntries(entries.map((entry, j) => [`${j + 1}. ${outputs2[j].getAttribute("name") || outputs2[j].getAttribute("label") || "\u8F93\u51FA"}`, only(entry, "text").textContent || ""]));
         return { id, when: true, output };
       });
       const matrix = buildMatrix({ id: snapshot.auxiliary, hit_policy: policy, rules: normalized });
       matrix.fields = fields;
       rules.forEach((r, i) => {
-        const atoms = children(r, "inputEntry").map((entry, j) => ({ id: String(j + 1), field: fields[j], label: only(entry, "text").textContent || "" }));
+        const atoms = children(r, "inputEntry").map((entry, j) => ({ id: String(j + 1), field: fields[j], label: only(entry, "text").textContent || "", feel: true }));
         matrix.rows[i].atoms = atoms;
+        matrix.rows[i].tree = { kind: "all", children: atoms.map((atom) => ({ kind: "predicate", atom })) };
+        matrix.rows[i].sourceRule = r.outerHTML;
+        matrix.rows[i].feel = true;
         matrix.rows[i].logic = "FEEL \u6761\u4EF6\uFF08\u4E14\uFF09";
         matrix.rows[i].fullLogic = atoms.map((a) => `${a.field}: ${a.label}`).join(" \u4E14 ");
       });
       matrix.note = `DMN XML \xB7 FEEL \u539F\u6587\uFF08\u8F93\u51FA\u4EE5 JSON \u5B57\u7B26\u4E32\u5C55\u793A\uFF09\xB7 \u4E0D\u6267\u884C\u8868\u8FBE\u5F0F\u6216\u4F9D\u8D56\u51B3\u7B56${table.hasAttribute("aggregation") ? ` \xB7 aggregation=${table.getAttribute("aggregation")}` : ""}`;
-      outputs.forEach((output, i) => {
+      outputs2.forEach((output, i) => {
         for (const [name, label] of [["defaultOutputEntry", "\u65E0\u5339\u914D\u9ED8\u8BA4\u8F93\u51FA"], ["outputValues", "\u8F93\u51FA\u503C\u987A\u5E8F"]]) {
           const entries = children(output, name);
           if (entries.length > 1) throw Error(`DMN ${name} \u4E0D\u552F\u4E00`);
@@ -647,6 +921,9 @@ source: ${literal(model.source)}` };
     need(Array.isArray(rows) && rows.length <= 4096 && rows.every(isRecord), "\u5B58\u50A8\u914D\u7F6E\u8BB0\u5F55\u7ED3\u6784\u4E0D\u652F\u6301");
     const matrix = buildMatrix({ id, hit_policy: "\u914D\u7F6E\u539F\u6587", rules: rows.map((row, i) => ({ id: String(i + 1), when: true, record: row })) });
     matrix.rows.forEach((row) => {
+      delete row.tree;
+      row.record = row.rule.record;
+      row.sourceRule = row.rule.record;
       row.logic = "\u914D\u7F6E\u8BB0\u5F55\uFF08\u672A\u6C42\u503C\uFF09";
       row.fullLogic = "\u672A\u7F16\u8BD1\u4E3A\u6267\u884C\u89C4\u5219\uFF1B\u6240\u6709\u8BB0\u5F55\u5B57\u6BB5\u6309\u539F\u6587\u5C55\u793A";
     });
@@ -900,10 +1177,10 @@ ${ref.version || ref.digest ? "\u5DF2\u6838\u5BF9\u8282\u70B9\u7248\u672C/\u6458
       }
     }
     need3(final?.status === "succeeded" && final.workflow_id === rd.publishedWorkflowId, "\u67E5\u8BE2\u5931\u8D25\u6216\u5DF2\u53D1\u5E03\u5DE5\u4F5C\u6D41\u7248\u672C\u6539\u53D8\uFF1B\u8BF7\u7531\u7EF4\u62A4\u8005\u590D\u6838\u7ED1\u5B9A");
-    const outputs = final.outputs;
-    need3(isRecord(outputs) && outputs.status_code === 200 && typeof outputs.result_json === "string", "\u67E5\u8BE2\u672A\u8FD4\u56DE\u6210\u529F\u8868\u4F53\uFF1B\u6307\u5B9A\u7248\u672C\u7F3A\u5931\u65F6\u4E0D\u56DE\u9000\u6700\u65B0\u7248");
+    const outputs2 = final.outputs;
+    need3(isRecord(outputs2) && outputs2.status_code === 200 && typeof outputs2.result_json === "string", "\u67E5\u8BE2\u672A\u8FD4\u56DE\u6210\u529F\u8868\u4F53\uFF1B\u6307\u5B9A\u7248\u672C\u7F3A\u5931\u65F6\u4E0D\u56DE\u9000\u6700\u65B0\u7248");
     need3(connections === scope && !signal.aborted, "\u67E5\u8BE2\u8FDE\u63A5\u5DF2\u5207\u6362\uFF0C\u7ED3\u679C\u5DF2\u4E22\u5F03");
-    const preview = await importStored(outputs.result_json, ref, "\u5DF2\u53D1\u5E03\u67E5\u8BE2\u5E94\u7528\u54CD\u5E94", "reader");
+    const preview = await importStored(outputs2.result_json, ref, "\u5DF2\u53D1\u5E03\u67E5\u8BE2\u5E94\u7528\u54CD\u5E94", "reader");
     need3(connections === scope && !signal.aborted, "\u67E5\u8BE2\u8FDE\u63A5\u5DF2\u5207\u6362\uFF0C\u7ED3\u679C\u5DF2\u4E22\u5F03");
     const finished = typeof final.finished_at === "number" && Math.abs(final.finished_at) < 864e10 ? new Date(final.finished_at * 1e3).toISOString() : "\u672A\u63D0\u4F9B";
     preview.provenance = `\u67E5\u8BE2\u5E94\u7528 ${rd.readAppId}
@@ -959,8 +1236,10 @@ ${preview.provenance}
     const body = element(document2, "div");
     container.append(body);
     renderMatrix(body, parsed.matrix, !!snapshot.format, page);
+    container.append(rawDetails(document2, "\u5B8C\u6574\u8282\u70B9\u5B9A\u4E49\uFF08\u539F\u6587\uFF09", snapshot.raw || ""));
+    if (snapshot.auxiliary) container.append(rawDetails(document2, "\u8282\u70B9\u7ED1\u5B9A\uFF08\u539F\u6587\uFF09", snapshot.auxiliary));
   }
-  function renderMatrix(container, matrix, formatted, page = 0, widths) {
+  function renderMatrix(container, matrix, formatted, page = 0, layout = { mode: "reading" }) {
     cancelColumnResize(container);
     const document2 = container.ownerDocument;
     container.replaceChildren();
@@ -971,11 +1250,24 @@ ${preview.provenance}
       container.append(element(document2, "div", `\u6B64\u8868\u542B ${columns} \u5217\uFF0C\u8D85\u8FC7\u53EF\u8BFB\u9884\u89C8\u4E0A\u9650 128 \u5217\uFF1B\u672A\u663E\u793A\u4E0D\u5B8C\u6574\u8868\u683C\u3002`, "dmnp-status"));
       return;
     }
+    const records = matrix.rows.some((row) => row.record !== void 0);
     const pageSize = 50;
     const pages = Math.max(1, Math.ceil(matrix.rows.length / pageSize));
     page = Math.max(0, Math.min(page, pages - 1));
-    container.append(element(document2, "div", `${matrix.table.id} \xB7 ${matrix.table.hit_policy} \xB7 ${matrix.rows.length} \u6761\u89C4\u5219 \xB7 \u9884\u89C8\u4E0D\u6C42\u503C`, "dmnp-meta"));
-    if (matrix.note) container.append(element(document2, "div", matrix.note, "dmnp-meta"));
+    container.append(element(document2, "div", `${matrix.table.id} \xB7 ${matrix.table.hit_policy} \xB7 ${matrix.rows.length} \u6761${records ? "\u914D\u7F6E\u8BB0\u5F55" : "\u89C4\u5219"} \xB7 \u9884\u89C8\u4E0D\u6C42\u503C`, "dmnp-meta"));
+    if (matrix.note) container.append(rawDetails(document2, "\u6A21\u578B\u4FE1\u606F\u4E0E\u65E0\u5339\u914D\u914D\u7F6E\uFF08\u539F\u6587\uFF09", matrix.note));
+    const views = element(document2, "nav", void 0, "dmnp-views");
+    views.setAttribute("aria-label", "\u9884\u89C8\u89C6\u56FE");
+    for (const [mode, label] of [["reading", "\u9605\u8BFB\u89C6\u56FE"], ["matrix", "\u77E9\u9635\u89C6\u56FE"]]) {
+      const button = element(document2, "button", label);
+      button.setAttribute("aria-pressed", String(layout.mode === mode));
+      button.addEventListener("click", () => {
+        layout.mode = mode;
+        renderMatrix(container, matrix, formatted, page, layout);
+      });
+      views.append(button);
+    }
+    container.append(views);
     const scroll = element(document2, "div", void 0, "dmnp-scroll");
     scroll.tabIndex = 0;
     scroll.setAttribute("aria-label", "\u51B3\u7B56\u8868\uFF0C\u53EF\u6A2A\u5411\u6EDA\u52A8");
@@ -983,12 +1275,14 @@ ${preview.provenance}
     table.setAttribute("aria-label", `\u51B3\u7B56\u8868 ${matrix.table.id}`);
     const head = table.createTHead();
     const header = head.insertRow();
-    for (const [index, label] of ["\u89C4\u5219", ...matrix.fields.map((field) => `\u6761\u4EF6 \xB7 ${formatted ? field : literal(field)}`), "\u903B\u8F91", ...matrix.outputs.map((output) => `\u8F93\u51FA \xB7 ${output.label}`)].entries()) {
+    const labels = layout.mode === "reading" ? records ? ["\u914D\u7F6E\u8BB0\u5F55", "\u8BF4\u660E", "\u914D\u7F6E\u5185\u5BB9"] : ["\u89C4\u5219", "\u6761\u4EF6\u8981\u6C42", "\u8F93\u51FA\u58F0\u660E"] : ["\u89C4\u5219", ...matrix.fields.map((field) => `\u6761\u4EF6 \xB7 ${formatted ? field : literal(field)}`), "\u903B\u8F91", ...matrix.outputs.map((output) => `\u8F93\u51FA \xB7 ${output.label}`)];
+    table.dataset.view = layout.mode;
+    for (const [index, label] of labels.entries()) {
       const th = document2.createElement("th");
       th.textContent = label;
       th.scope = "col";
-      if (index === matrix.fields.length + 1) th.className = "dmnp-logic-cell";
-      if (index > matrix.fields.length + 1) th.className = "dmnp-output-cell";
+      if (layout.mode === "matrix" && index === matrix.fields.length + 1) th.className = "dmnp-logic-cell";
+      if (layout.mode === "matrix" && index > matrix.fields.length + 1) th.className = "dmnp-output-cell";
       header.append(th);
     }
     const body = table.createTBody();
@@ -998,6 +1292,19 @@ ${preview.provenance}
       id.scope = "row";
       id.textContent = row.rule.id;
       tr.append(id);
+      if (layout.mode === "reading") {
+        id.prepend(element(document2, "div", `\u7B2C ${matrix.rows.indexOf(row) + 1} \u6761${records ? "\u914D\u7F6E\u8BB0\u5F55" : "\u89C4\u5219"}`, "dmnp-rule-number"));
+        id.append(rawDetails(document2, row.record !== void 0 ? "\u6E90\u914D\u7F6E JSON" : row.feel ? "\u6E90\u89C4\u5219 XML\uFF08\u5E8F\u5217\u5316\uFF09" : "\u6E90\u89C4\u5219 JSON", typeof row.sourceRule === "string" ? row.sourceRule : JSON.stringify(row.sourceRule ?? row.rule, null, 2)));
+        const condition = tr.insertCell();
+        if (row.record !== void 0) condition.append(element(document2, "p", "\u914D\u7F6E\u8BB0\u5F55 \xB7 \u672A\u7F16\u8BD1\u4E3A\u6267\u884C\u89C4\u5219\uFF0C\u672A\u6C42\u503C"));
+        else {
+          if (row.tree) condition.append(conditions(document2, row.tree));
+          condition.append(rawDetails(document2, "\u903B\u8F91\u8868\u8FBE\u5F0F\u4E0E\u5B8C\u6574\u8DEF\u5F84", `${row.logic}
+${row.fullLogic}`));
+        }
+        tr.insertCell().append(outputs(document2, row));
+        continue;
+      }
       for (const field of matrix.fields) {
         const cell = tr.insertCell();
         const atoms = row.atoms.filter((atom) => atom.field === field);
@@ -1020,8 +1327,8 @@ ${preview.provenance}
         } else cell.textContent = text;
       }
     }
-    const defaults = [140, ...matrix.fields.map(() => 180), 260, ...matrix.outputs.map(() => 240)];
-    widths ??= [...defaults];
+    const defaults = layout.mode === "reading" ? [180, 480, 380] : [140, ...matrix.fields.map(() => 180), 260, ...matrix.outputs.map(() => 240)];
+    const widths = layout[layout.mode] ??= [...defaults];
     resizeColumns(table, widths, defaults);
     scroll.append(table);
     container.append(scroll);
@@ -1031,14 +1338,14 @@ ${preview.provenance}
       paging.setAttribute("aria-label", "\u89C4\u5219\u5206\u9875");
       const previous = element(document2, "button", "\u4E0A\u4E00\u9875");
       previous.disabled = page === 0;
-      previous.addEventListener("click", () => renderMatrix(container, matrix, formatted, page - 1, widths));
+      previous.addEventListener("click", () => renderMatrix(container, matrix, formatted, page - 1, layout));
       const next = element(document2, "button", "\u4E0B\u4E00\u9875");
       next.disabled = page === pages - 1;
-      next.addEventListener("click", () => renderMatrix(container, matrix, formatted, page + 1, widths));
+      next.addEventListener("click", () => renderMatrix(container, matrix, formatted, page + 1, layout));
       paging.append(previous, element(document2, "span", `\u7B2C ${page + 1}/${pages} \u9875 \xB7 \u6BCF\u9875\u6700\u591A ${pageSize} \u6761`), next);
       container.append(paging);
     }
-    container.append(element(document2, "div", "\u62D6\u52A8\u8868\u5934\u53F3\u8FB9\u754C\u8C03\u6574\u5217\u5BBD \xB7 \u53CC\u51FB\u8FB9\u754C\u8FD8\u539F \xB7 \u70B9\u51FB\u903B\u8F91\u67E5\u770B\u5B8C\u6574\u6761\u4EF6 \xB7 \u53EA\u8BFB\u9884\u89C8\u4E0D\u5224\u65AD\u89C4\u5219\u547D\u4E2D", "dmnp-footnote"));
+    container.append(element(document2, "div", "\u62D6\u52A8\u8868\u5934\u53F3\u8FB9\u754C\u8C03\u6574\u5217\u5BBD \xB7 \u53CC\u51FB\u8FB9\u754C\u8FD8\u539F \xB7 \u5C55\u5F00\u8BE6\u60C5\u67E5\u770B\u539F\u6587\u4E0E\u5B8C\u6574\u8DEF\u5F84 \xB7 \u53EA\u8BFB\u9884\u89C8\u4E0D\u5224\u65AD\u89C4\u5219\u547D\u4E2D", "dmnp-footnote"));
   }
   function importControls(container, ref) {
     const document2 = container.ownerDocument;
@@ -1241,6 +1548,7 @@ ${preview.provenance}
       lastSnapshot = detail;
       renderSnapshot(body, snapshot);
     }, cleanup = function() {
+      disposePanel();
       cancelPreview(body);
       clearReaderConnections();
       clearInterval(watchdog);
@@ -1258,10 +1566,6 @@ ${preview.provenance}
     const readonly = element(document, "span", "\u6D4F\u89C8\u5668\u6269\u5C55 \xB7 \u53EA\u8BFB", "dmnp-badge");
     const grow = element(document, "button", "\u5C55\u5F00");
     grow.setAttribute("aria-label", "\u5C55\u5F00\u6216\u8FD8\u539F\u51B3\u7B56\u8868");
-    grow.addEventListener("click", () => {
-      const expanded = root.classList.toggle("dmnp-expanded");
-      grow.textContent = expanded ? "\u8FD8\u539F" : "\u5C55\u5F00";
-    });
     const close = element(document, "button", "\u5173\u95ED");
     const body = element(document, "div", void 0, "dmnp-body");
     let lastSnapshot = "";
@@ -1278,6 +1582,7 @@ ${preview.provenance}
     header.append(title, readonly, grow, close);
     root.append(header, body);
     document.documentElement.append(root);
+    const disposePanel = resizePanel(root, grow);
     document.addEventListener(SNAPSHOT_EVENT, receive);
     renderSnapshot(body, { status: "idle", message: "\u6B63\u5728\u8BFB\u53D6\u5F53\u524D\u9009\u4E2D\u7684 DMN \u8282\u70B9\u2026" });
   }

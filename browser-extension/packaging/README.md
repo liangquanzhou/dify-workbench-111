@@ -1,4 +1,4 @@
-# DMN Browser Preview 0.4.3
+# DMN Browser Preview 0.4.4
 
 This archive is a Chrome/MV3 browser extension, not a Dify .difypkg.
 Load this extracted directory using your organization's approved extension installation method, open a supported Dify workflow, and invoke the toolbar action. Refreshing the page requires reactivation.

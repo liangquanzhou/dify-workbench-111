@@ -1,3 +1,4 @@
+import { conditions, outputs, rawDetails } from './readable'
 import { resizeColumns, cancelColumnResize } from './column-resize'
 import { parseTable, literal, outputValue } from './model'
 import type { Snapshot, StoredReference } from './binding'
@@ -49,8 +50,11 @@ export function renderSnapshot(container: HTMLElement, snapshot: Snapshot, page 
   const body = element(document, 'div')
   container.append(body)
   renderMatrix(body, parsed.matrix, !!snapshot.format, page)
+  container.append(rawDetails(document, '完整节点定义（原文）', snapshot.raw || ''))
+  if (snapshot.auxiliary) container.append(rawDetails(document, '节点绑定（原文）', snapshot.auxiliary))
 }
-function renderMatrix(container: HTMLElement, matrix: Matrix, formatted: boolean, page = 0, widths?: number[]) {
+type Layout = { mode: 'reading' | 'matrix'; reading?: number[]; matrix?: number[] }
+function renderMatrix(container: HTMLElement, matrix: Matrix, formatted: boolean, page = 0, layout: Layout = { mode: 'reading' }) {
   cancelColumnResize(container)
   const document = container.ownerDocument
   container.replaceChildren()
@@ -61,11 +65,21 @@ function renderMatrix(container: HTMLElement, matrix: Matrix, formatted: boolean
     container.append(element(document, 'div', `此表含 ${columns} 列，超过可读预览上限 128 列；未显示不完整表格。`, 'dmnp-status'))
     return
   }
+  const records = matrix.rows.some(row => row.record !== undefined)
   const pageSize = 50
   const pages = Math.max(1, Math.ceil(matrix.rows.length / pageSize))
   page = Math.max(0, Math.min(page, pages - 1))
-  container.append(element(document, 'div', `${matrix.table.id} · ${matrix.table.hit_policy} · ${matrix.rows.length} 条规则 · 预览不求值`, 'dmnp-meta'))
-  if (matrix.note) container.append(element(document, 'div', matrix.note, 'dmnp-meta'))
+  container.append(element(document, 'div', `${matrix.table.id} · ${matrix.table.hit_policy} · ${matrix.rows.length} 条${records ? '配置记录' : '规则'} · 预览不求值`, 'dmnp-meta'))
+  if (matrix.note) container.append(rawDetails(document, '模型信息与无匹配配置（原文）', matrix.note))
+  const views = element(document, 'nav', undefined, 'dmnp-views')
+  views.setAttribute('aria-label', '预览视图')
+  for (const [mode, label] of [['reading', '阅读视图'], ['matrix', '矩阵视图']] as const) {
+    const button = element(document, 'button', label)
+    button.setAttribute('aria-pressed', String(layout.mode === mode))
+    button.addEventListener('click', () => { layout.mode = mode; renderMatrix(container, matrix, formatted, page, layout) })
+    views.append(button)
+  }
+  container.append(views)
   const scroll = element(document, 'div', undefined, 'dmnp-scroll')
   scroll.tabIndex = 0
   scroll.setAttribute('aria-label', '决策表，可横向滚动')
@@ -73,12 +87,14 @@ function renderMatrix(container: HTMLElement, matrix: Matrix, formatted: boolean
   table.setAttribute('aria-label', `决策表 ${matrix.table.id}`)
   const head = table.createTHead()
   const header = head.insertRow()
-  for (const [index, label] of ['规则', ...matrix.fields.map(field => `条件 · ${formatted ? field : literal(field)}`), '逻辑', ...matrix.outputs.map(output => `输出 · ${output.label}`)].entries()) {
+  const labels = layout.mode === 'reading' ? (records ? ['配置记录', '说明', '配置内容'] : ['规则', '条件要求', '输出声明']) : ['规则', ...matrix.fields.map(field => `条件 · ${formatted ? field : literal(field)}`), '逻辑', ...matrix.outputs.map(output => `输出 · ${output.label}`)]
+  table.dataset.view = layout.mode
+  for (const [index, label] of labels.entries()) {
     const th = document.createElement('th')
     th.textContent = label
     th.scope = 'col'
-    if (index === matrix.fields.length + 1) th.className = 'dmnp-logic-cell'
-    if (index > matrix.fields.length + 1) th.className = 'dmnp-output-cell'
+    if (layout.mode === 'matrix' && index === matrix.fields.length + 1) th.className = 'dmnp-logic-cell'
+    if (layout.mode === 'matrix' && index > matrix.fields.length + 1) th.className = 'dmnp-output-cell'
     header.append(th)
   }
   const body = table.createTBody()
@@ -88,6 +104,18 @@ function renderMatrix(container: HTMLElement, matrix: Matrix, formatted: boolean
     id.scope = 'row'
     id.textContent = row.rule.id
     tr.append(id)
+    if (layout.mode === 'reading') {
+      id.prepend(element(document, 'div', `第 ${matrix.rows.indexOf(row) + 1} 条${records ? '配置记录' : '规则'}`, 'dmnp-rule-number'))
+      id.append(rawDetails(document, row.record !== undefined ? '源配置 JSON' : row.feel ? '源规则 XML（序列化）' : '源规则 JSON', typeof row.sourceRule === 'string' ? row.sourceRule : JSON.stringify(row.sourceRule ?? row.rule, null, 2)))
+      const condition = tr.insertCell()
+      if (row.record !== undefined) condition.append(element(document, 'p', '配置记录 · 未编译为执行规则，未求值'))
+      else {
+        if (row.tree) condition.append(conditions(document, row.tree))
+        condition.append(rawDetails(document, '逻辑表达式与完整路径', `${row.logic}\n${row.fullLogic}`))
+      }
+      tr.insertCell().append(outputs(document, row))
+      continue
+    }
     for (const field of matrix.fields) {
       const cell = tr.insertCell()
       const atoms = row.atoms.filter(atom => atom.field === field)
@@ -110,8 +138,8 @@ function renderMatrix(container: HTMLElement, matrix: Matrix, formatted: boolean
       } else cell.textContent = text
     }
   }
-  const defaults = [140, ...matrix.fields.map(() => 180), 260, ...matrix.outputs.map(() => 240)]
-  widths ??= [...defaults]
+  const defaults = layout.mode === 'reading' ? [180, 480, 380] : [140, ...matrix.fields.map(() => 180), 260, ...matrix.outputs.map(() => 240)]
+  const widths = layout[layout.mode] ??= [...defaults]
   resizeColumns(table, widths, defaults)
   scroll.append(table)
   container.append(scroll)
@@ -121,14 +149,14 @@ function renderMatrix(container: HTMLElement, matrix: Matrix, formatted: boolean
     paging.setAttribute('aria-label', '规则分页')
     const previous = element(document, 'button', '上一页') as HTMLButtonElement
     previous.disabled = page === 0
-    previous.addEventListener('click', () => renderMatrix(container, matrix, formatted, page - 1, widths))
+    previous.addEventListener('click', () => renderMatrix(container, matrix, formatted, page - 1, layout))
     const next = element(document, 'button', '下一页') as HTMLButtonElement
     next.disabled = page === pages - 1
-    next.addEventListener('click', () => renderMatrix(container, matrix, formatted, page + 1, widths))
+    next.addEventListener('click', () => renderMatrix(container, matrix, formatted, page + 1, layout))
     paging.append(previous, element(document, 'span', `第 ${page + 1}/${pages} 页 · 每页最多 ${pageSize} 条`), next)
     container.append(paging)
   }
-  container.append(element(document, 'div', '拖动表头右边界调整列宽 · 双击边界还原 · 点击逻辑查看完整条件 · 只读预览不判断规则命中', 'dmnp-footnote'))
+  container.append(element(document, 'div', '拖动表头右边界调整列宽 · 双击边界还原 · 展开详情查看原文与完整路径 · 只读预览不判断规则命中', 'dmnp-footnote'))
 }
 
 function importControls(container: HTMLElement, ref: StoredReference) {

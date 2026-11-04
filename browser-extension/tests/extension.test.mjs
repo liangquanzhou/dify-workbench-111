@@ -63,7 +63,7 @@ test('accessor props are never invoked',()=>{
  const {window:{document}}=dom();const e=node(document,'A',data());Object.defineProperty(e,'__reactProps$test',{get(){throw Error('should not run')}});assert.equal(readRenderedNode(e),null)
 })
 test('renderer shows actual fields, rule order, outputs, logic',()=>{
- const {window:{document}}=dom();const c=document.createElement('div');renderSnapshot(c,extractTable(data(),'A'))
+ const {window:{document}}=dom();const c=document.createElement('div');renderSnapshot(c,extractTable(data(),'A'));[...c.querySelectorAll('button')].find(b=>b.textContent==='矩阵视图').click()
  assert.equal(c.querySelectorAll('tbody tr').length,2);assert.deepEqual([...c.querySelectorAll('tbody th')].map(e=>e.textContent),['priority','standard'])
  assert.match(c.textContent,/条件 · "amount"/);assert.match(c.textContent,/条件 · "vip"/);assert.match(c.textContent,/\(A 且 B\)/);assert.match(c.textContent,/express/);assert.match(c.textContent,/预览不求值/)
 })
@@ -83,10 +83,10 @@ test('no HTML execution: user strings are text only',()=>{
 })
 test('pagination includes all rules and switch resets page',()=>{
  const {window:{document}}=dom();const c=document.createElement('div');const big={id:'big',hit_policy:'COLLECT',rules:Array.from({length:125},(_,i)=>({id:`r${i}`,when:true,output:i}))}
- renderSnapshot(c,extractTable(data(JSON.stringify(big)),'A'));assert.equal(c.querySelectorAll('tbody tr').length,50)
- c.querySelectorAll('nav button')[1].click();assert.equal(c.querySelector('tbody th').textContent,'r50')
- c.querySelectorAll('nav button')[1].click();assert.equal(c.querySelectorAll('tbody tr').length,25);assert.equal(c.querySelector('tbody th').textContent,'r100')
- renderSnapshot(c,extractTable(data(),'B'));assert.equal(c.querySelector('tbody th').textContent,'priority');assert.equal(c.querySelector('nav'),null)
+ renderSnapshot(c,extractTable(data(JSON.stringify(big)),'A'));[...c.querySelectorAll('button')].find(b=>b.textContent==='矩阵视图').click();assert.equal(c.querySelectorAll('tbody tr').length,50)
+ c.querySelectorAll('.dmnp-paging button')[1].click();assert.equal(c.querySelector('tbody th').textContent,'r50')
+ c.querySelectorAll('.dmnp-paging button')[1].click();assert.equal(c.querySelectorAll('tbody tr').length,25);assert.equal(c.querySelector('tbody th').textContent,'r100')
+ renderSnapshot(c,extractTable(data(),'B'));[...c.querySelectorAll('button')].find(b=>b.textContent==='矩阵视图').click();assert.equal(c.querySelector('tbody th').textContent,'priority');assert.equal(c.querySelector('.dmnp-paging'),null)
 })
 test('too wide tables fail clearly without truncated misleading matrix',()=>{
  const {window:{document}}=dom();const c=document.createElement('div');const output=Object.fromEntries(Array.from({length:130},(_,i)=>[`c${i}`,i]))

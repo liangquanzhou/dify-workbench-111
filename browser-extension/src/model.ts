@@ -16,12 +16,23 @@ export type Atom = {
   id: string;
   field: string;
   label: string;
+  path?: string[];
+  operator?: string;
+  value?: Json;
+  feel?: boolean;
 }
+export type ConditionTree = { kind: 'all' | 'any'; children: ConditionTree[] } | { kind: 'constant'; value: boolean } | { kind: 'predicate'; atom: Atom }
 export type MatrixRow = {
   rule: Rule;
   atoms: Atom[];
   logic: string;
   fullLogic: string;
+  tree?: ConditionTree;
+  sourceRule?: Json | string;
+  record?: Json;
+  templateRef?: string;
+  template?: Json;
+  feel?: boolean;
 }
 export type OutputColumn = {
   key: string;
@@ -277,7 +288,13 @@ export function buildMatrix(table: Table): Matrix {
       else
         addOutput(parent)
     })
-    return { rule, atoms, logic, fullLogic }
+    let cursor = 0
+    const tree = (v: Json): ConditionTree => {
+      if (typeof v === 'boolean') return {kind: 'constant', value: v}
+      const [op, arg] = Object.entries(v as Record<string, Json>)[0]
+      return op === 'all' || op === 'any' ? {kind: op, children: (arg as Json[]).map(tree)} : {kind: 'predicate', atom: atoms[cursor++]}
+    }
+    return { rule, atoms, logic, fullLogic, tree: tree(rule.when), sourceRule: rule }
   })
   return { table, fields, outputs, rows }
 }

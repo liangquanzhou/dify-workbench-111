@@ -40,8 +40,11 @@ export function parseXml(snapshot: Snapshot, document: Document): { kind: 'ready
     const matrix = buildMatrix({ id: snapshot.auxiliary!, hit_policy: policy as Table['hit_policy'], rules: normalized })
     matrix.fields = fields
     rules.forEach((r, i) => {
-      const atoms = children(r, 'inputEntry').map((entry, j) => ({ id: String(j + 1), field: fields[j], label: only(entry, 'text').textContent || '' }))
+      const atoms = children(r, 'inputEntry').map((entry, j) => ({ id: String(j + 1), field: fields[j], label: only(entry, 'text').textContent || '', feel: true }))
       matrix.rows[i].atoms = atoms
+      matrix.rows[i].tree = {kind: 'all', children: atoms.map(atom => ({kind: 'predicate', atom}))}
+      matrix.rows[i].sourceRule = r.outerHTML
+      matrix.rows[i].feel = true
       matrix.rows[i].logic = 'FEEL 条件（且）'
       matrix.rows[i].fullLogic = atoms.map(a => `${a.field}: ${a.label}`).join(' 且 ')
     })

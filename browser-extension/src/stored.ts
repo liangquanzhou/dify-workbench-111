@@ -81,7 +81,7 @@ export function pythonCanonicalizer(raw: string): (value: Json, path?: string[])
 function configMatrix(id: string, rows: Json): Matrix {
   need(Array.isArray(rows) && rows.length <= 4096 && rows.every(isRecord), '存储配置记录结构不支持')
   const matrix = buildMatrix({ id, hit_policy: '配置原文', rules: rows.map((row, i) => ({ id: String(i + 1), when: true, record: row })) })
-  matrix.rows.forEach(row => { row.logic = '配置记录（未求值）'; row.fullLogic = '未编译为执行规则；所有记录字段按原文展示' })
+  matrix.rows.forEach(row => { delete row.tree; row.record = row.rule.record; row.sourceRule = row.rule.record; row.logic = '配置记录（未求值）'; row.fullLogic = '未编译为执行规则；所有记录字段按原文展示' })
   matrix.note = '存储配置原文 · 不是编译后的执行决策表 · 请展开完整文档查看字典和声明'
   return matrix
 }

@@ -1,3 +1,4 @@
+import { resizePanel } from './panel-resize'
 import { REFRESH_EVENT, SNAPSHOT_EVENT, STOP_EVENT, MAX_TABLE_CHARS } from './binding'
 import { MAX_DEFINITION_BYTES } from './model'
 import type { Snapshot } from './binding'
@@ -17,10 +18,6 @@ if (existing) {
   const readonly = element(document, 'span', '浏览器扩展 · 只读', 'dmnp-badge')
   const grow = element(document, 'button', '展开') as HTMLButtonElement
   grow.setAttribute('aria-label', '展开或还原决策表')
-  grow.addEventListener('click', () => {
-    const expanded = root.classList.toggle('dmnp-expanded')
-    grow.textContent = expanded ? '还原' : '展开'
-  })
   const close = element(document, 'button', '关闭')
   const body = element(document, 'div', undefined, 'dmnp-body')
   let lastSnapshot = ''
@@ -63,7 +60,7 @@ if (existing) {
     }
   }, 1000)
   function cleanup() {
-    cancelPreview(body); clearReaderConnections()
+    disposePanel(); cancelPreview(body); clearReaderConnections()
     clearInterval(watchdog)
     document.removeEventListener(SNAPSHOT_EVENT, receive)
     document.dispatchEvent(new CustomEvent(STOP_EVENT))
@@ -74,6 +71,7 @@ if (existing) {
   header.append(title, readonly, grow, close)
   root.append(header, body)
   document.documentElement.append(root)
+  const disposePanel = resizePanel(root, grow)
   document.addEventListener(SNAPSHOT_EVENT, receive)
   renderSnapshot(body, { status: 'idle', message: '正在读取当前选中的 DMN 节点…' })
 }
