@@ -31,3 +31,14 @@
 #dmn-preview-extension-root .dmnp-footnote { margin-top: 8px; font-size: 11px; color: #687d8b; }
 #dmn-preview-extension-root .dmnp-paging { display: flex; gap: 12px; align-items: center; justify-content: center; margin-top: 8px; }
 @media (max-width: 850px) { #dmn-preview-extension-root { width: calc(100vw - 28px); min-width: 0; max-height: 46vh; } #dmn-preview-extension-root .dmnp-badge { font-size: 10px; } }
+
+#dmn-preview-extension-root table.dmnp-resizable { table-layout: fixed; }
+#dmn-preview-extension-root .dmnp-resizable th, #dmn-preview-extension-root .dmnp-resizable td { min-width: 0; max-width: none; }
+#dmn-preview-extension-root .dmnp-resizable thead th { padding-right: 18px; }
+#dmn-preview-extension-root .dmnp-column-resize { position: absolute; top: 0; right: 0; bottom: 0; width: 10px; cursor: col-resize; touch-action: none; user-select: none; }
+#dmn-preview-extension-root .dmnp-column-resize::after { content: ''; position: absolute; top: 4px; bottom: 4px; right: 0; width: 2px; background: #147b9e; opacity: .25; }
+#dmn-preview-extension-root .dmnp-column-resize:hover::after, #dmn-preview-extension-root .dmnp-column-resize:focus-visible::after, #dmn-preview-extension-root .dmnp-resizing-column::after { opacity: 1; width: 3px; }
+#dmn-preview-extension-root .dmnp-column-resize:focus-visible { outline: 2px solid #147b9e; outline-offset: -2px; }
+#dmn-preview-extension-root .dmnp-resizing, #dmn-preview-extension-root .dmnp-resizing * { cursor: col-resize; user-select: none; }
+
+#dmn-preview-extension-root .dmnp-resizable thead th:first-child { left: 0; z-index: 3; }

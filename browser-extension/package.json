@@ -1,11 +1,11 @@
 {
   "name": "dmn-browser-preview",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node --test tests/extension.test.mjs tests/stored.test.mjs tests/reader-app.test.mjs tests/store-node.test.mjs tests/v0519.test.mjs",
+    "test": "node --test tests/extension.test.mjs tests/stored.test.mjs tests/reader-app.test.mjs tests/store-node.test.mjs tests/v0519.test.mjs tests/column-resize.test.mjs",
     "typecheck": "tsc --noEmit",
     "test:upstream": "node --test tests/brian.test.mjs",
     "test:all": "node --test tests/*.test.mjs"

@@ -1,3 +1,4 @@
+import { resizeColumns, cancelColumnResize } from './column-resize'
 import { parseTable, literal, outputValue } from './model'
 import type { Snapshot, StoredReference } from './binding'
 import { parseBrian } from './brian'
@@ -8,7 +9,7 @@ import type { Matrix } from './model'
 import type { StoredPreview } from './stored'
 import { connectReaders, readerConnected, readFromApp, clearReaderConnections } from './reader-app'
 const pendingReads = new WeakMap<HTMLElement, AbortController>()
-export function cancelPreview(container: HTMLElement) { pendingReads.get(container)?.abort(); pendingReads.delete(container) }
+export function cancelPreview(container: HTMLElement) { cancelColumnResize(container); pendingReads.get(container)?.abort(); pendingReads.delete(container) }
 const renderGenerations = new WeakMap<HTMLElement, object>()
 export function element(document: Document, tag: string, text?: string, className?: string): HTMLElement {
   const result = document.createElement(tag)
@@ -49,7 +50,8 @@ export function renderSnapshot(container: HTMLElement, snapshot: Snapshot, page 
   container.append(body)
   renderMatrix(body, parsed.matrix, !!snapshot.format, page)
 }
-function renderMatrix(container: HTMLElement, matrix: Matrix, formatted: boolean, page = 0) {
+function renderMatrix(container: HTMLElement, matrix: Matrix, formatted: boolean, page = 0, widths?: number[]) {
+  cancelColumnResize(container)
   const document = container.ownerDocument
   container.replaceChildren()
   const columns = matrix.fields.length + matrix.outputs.length + 2
@@ -108,6 +110,9 @@ function renderMatrix(container: HTMLElement, matrix: Matrix, formatted: boolean
       } else cell.textContent = text
     }
   }
+  const defaults = [140, ...matrix.fields.map(() => 180), 260, ...matrix.outputs.map(() => 240)]
+  widths ??= [...defaults]
+  resizeColumns(table, widths, defaults)
   scroll.append(table)
   container.append(scroll)
   if (!matrix.rows.length) container.append(element(document, 'div', '此表没有规则。', 'dmnp-status'))
@@ -116,14 +121,14 @@ function renderMatrix(container: HTMLElement, matrix: Matrix, formatted: boolean
     paging.setAttribute('aria-label', '规则分页')
     const previous = element(document, 'button', '上一页') as HTMLButtonElement
     previous.disabled = page === 0
-    previous.addEventListener('click', () => renderMatrix(container, matrix, formatted, page - 1))
+    previous.addEventListener('click', () => renderMatrix(container, matrix, formatted, page - 1, widths))
     const next = element(document, 'button', '下一页') as HTMLButtonElement
     next.disabled = page === pages - 1
-    next.addEventListener('click', () => renderMatrix(container, matrix, formatted, page + 1))
+    next.addEventListener('click', () => renderMatrix(container, matrix, formatted, page + 1, widths))
     paging.append(previous, element(document, 'span', `第 ${page + 1}/${pages} 页 · 每页最多 ${pageSize} 条`), next)
     container.append(paging)
   }
-  container.append(element(document, 'div', '只读结构预览 · 点击逻辑查看完整条件 · 预览不判断规则命中', 'dmnp-footnote'))
+  container.append(element(document, 'div', '拖动表头右边界调整列宽 · 双击边界还原 · 点击逻辑查看完整条件 · 只读预览不判断规则命中', 'dmnp-footnote'))
 }
 
 function importControls(container: HTMLElement, ref: StoredReference) {

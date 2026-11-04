@@ -253,6 +253,132 @@
     return /^\/v2\/app\/[^/]+\/?$/.test(location.pathname) && new URLSearchParams(location.search).get("mode") === "workflow";
   }
 
+  // src/column-resize.ts
+  var MIN_WIDTH = 100;
+  var MAX_WIDTH = 1600;
+  var cleanups = /* @__PURE__ */ new WeakMap();
+  function cancelColumnResize(container) {
+    for (const table of Array.from(container.querySelectorAll("table"))) cleanups.get(table)?.();
+  }
+  function resizeColumns(table, widths, defaults) {
+    const document2 = table.ownerDocument;
+    const window = document2.defaultView;
+    const group = document2.createElement("colgroup");
+    const cols = widths.map((width) => {
+      const col = document2.createElement("col");
+      col.style.width = `${width}px`;
+      group.append(col);
+      return col;
+    });
+    table.prepend(group);
+    table.classList.add("dmnp-resizable");
+    let total = widths.reduce((sum, width) => sum + width, 0);
+    table.style.width = `${total}px`;
+    let endDrag;
+    cleanups.set(table, () => endDrag?.());
+    for (const [index, th] of Array.from(table.tHead.rows[0].cells).entries()) {
+      const handle = document2.createElement("span");
+      handle.className = "dmnp-column-resize";
+      handle.tabIndex = 0;
+      handle.setAttribute("role", "separator");
+      handle.setAttribute("aria-orientation", "vertical");
+      handle.setAttribute("aria-label", `\u8C03\u6574${th.textContent}\u5217\u5BBD`);
+      handle.setAttribute("aria-valuemin", String(MIN_WIDTH));
+      handle.setAttribute("aria-valuemax", String(MAX_WIDTH));
+      handle.setAttribute("aria-valuenow", String(widths[index]));
+      handle.title = "\u62D6\u52A8\u8C03\u6574\u5217\u5BBD\uFF1B\u53CC\u51FB\u8FD8\u539F\uFF1B\u65B9\u5411\u952E\u5FAE\u8C03";
+      th.append(handle);
+      const setWidth = (value) => {
+        const width = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, Math.round(value)));
+        total += width - widths[index];
+        widths[index] = width;
+        cols[index].style.width = `${width}px`;
+        table.style.width = `${total}px`;
+        handle.setAttribute("aria-valuenow", String(width));
+      };
+      handle.addEventListener("dblclick", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        endDrag?.();
+        setWidth(defaults[index]);
+      });
+      handle.addEventListener("keydown", (event) => {
+        const step = event.shiftKey ? 50 : 10;
+        const target = event.key === "ArrowLeft" ? widths[index] - step : event.key === "ArrowRight" ? widths[index] + step : event.key === "Home" ? MIN_WIDTH : event.key === "End" ? MAX_WIDTH : void 0;
+        if (target !== void 0) {
+          event.preventDefault();
+          event.stopPropagation();
+          setWidth(target);
+        }
+      });
+      handle.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0 || event.isPrimary === false) return;
+        event.preventDefault();
+        event.stopPropagation();
+        endDrag?.();
+        const startX = event.clientX;
+        const startWidth = widths[index];
+        let pending = startWidth;
+        let frame;
+        const flush = () => {
+          frame = void 0;
+          setWidth(pending);
+        };
+        const finish = () => {
+          if (frame !== void 0) {
+            window.cancelAnimationFrame(frame);
+            flush();
+          }
+          handle.removeEventListener("pointermove", move);
+          handle.removeEventListener("pointerup", up);
+          handle.removeEventListener("pointercancel", cancel);
+          handle.removeEventListener("lostpointercapture", finish);
+          window.removeEventListener("blur", finish);
+          handle.removeEventListener("keydown", escape);
+          table.classList.remove("dmnp-resizing");
+          handle.classList.remove("dmnp-resizing-column");
+          endDrag = void 0;
+          if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+        };
+        const move = (next) => {
+          if (next.pointerId !== event.pointerId) return;
+          next.preventDefault();
+          next.stopPropagation();
+          pending = startWidth + next.clientX - startX;
+          if (frame === void 0) frame = window.requestAnimationFrame(flush);
+        };
+        const up = (next) => {
+          if (next.pointerId !== event.pointerId) return;
+          move(next);
+          finish();
+        };
+        const cancel = () => {
+          pending = startWidth;
+          finish();
+          setWidth(startWidth);
+        };
+        const escape = (key) => {
+          if (key.key === "Escape") {
+            key.preventDefault();
+            key.stopPropagation();
+            cancel();
+          }
+        };
+        endDrag = finish;
+        handle.setPointerCapture(event.pointerId);
+        handle.focus({ preventScroll: true });
+        table.classList.add("dmnp-resizing");
+        handle.classList.add("dmnp-resizing-column");
+        handle.addEventListener("pointermove", move);
+        handle.addEventListener("pointerup", up);
+        handle.addEventListener("pointercancel", cancel);
+        handle.addEventListener("lostpointercapture", finish);
+        handle.addEventListener("keydown", escape);
+        window.addEventListener("blur", finish);
+      });
+    }
+  }
+
   // src/brian.ts
   var operators = { eq: "=", ne: "\u2260", lt: "<", lte: "\u2264", gt: ">", gte: "\u2265", in: "\u5C5E\u4E8E", exists: "\u5B58\u5728", is_null: "\u4E3A null" };
   function requireShape(ok, message) {
@@ -791,6 +917,7 @@ ${preview.provenance}
   // src/view.ts
   var pendingReads = /* @__PURE__ */ new WeakMap();
   function cancelPreview(container) {
+    cancelColumnResize(container);
     pendingReads.get(container)?.abort();
     pendingReads.delete(container);
   }
@@ -833,7 +960,8 @@ ${preview.provenance}
     container.append(body);
     renderMatrix(body, parsed.matrix, !!snapshot.format, page);
   }
-  function renderMatrix(container, matrix, formatted, page = 0) {
+  function renderMatrix(container, matrix, formatted, page = 0, widths) {
+    cancelColumnResize(container);
     const document2 = container.ownerDocument;
     container.replaceChildren();
     const columns = matrix.fields.length + matrix.outputs.length + 2;
@@ -892,6 +1020,9 @@ ${preview.provenance}
         } else cell.textContent = text;
       }
     }
+    const defaults = [140, ...matrix.fields.map(() => 180), 260, ...matrix.outputs.map(() => 240)];
+    widths ??= [...defaults];
+    resizeColumns(table, widths, defaults);
     scroll.append(table);
     container.append(scroll);
     if (!matrix.rows.length) container.append(element(document2, "div", "\u6B64\u8868\u6CA1\u6709\u89C4\u5219\u3002", "dmnp-status"));
@@ -900,14 +1031,14 @@ ${preview.provenance}
       paging.setAttribute("aria-label", "\u89C4\u5219\u5206\u9875");
       const previous = element(document2, "button", "\u4E0A\u4E00\u9875");
       previous.disabled = page === 0;
-      previous.addEventListener("click", () => renderMatrix(container, matrix, formatted, page - 1));
+      previous.addEventListener("click", () => renderMatrix(container, matrix, formatted, page - 1, widths));
       const next = element(document2, "button", "\u4E0B\u4E00\u9875");
       next.disabled = page === pages - 1;
-      next.addEventListener("click", () => renderMatrix(container, matrix, formatted, page + 1));
+      next.addEventListener("click", () => renderMatrix(container, matrix, formatted, page + 1, widths));
       paging.append(previous, element(document2, "span", `\u7B2C ${page + 1}/${pages} \u9875 \xB7 \u6BCF\u9875\u6700\u591A ${pageSize} \u6761`), next);
       container.append(paging);
     }
-    container.append(element(document2, "div", "\u53EA\u8BFB\u7ED3\u6784\u9884\u89C8 \xB7 \u70B9\u51FB\u903B\u8F91\u67E5\u770B\u5B8C\u6574\u6761\u4EF6 \xB7 \u9884\u89C8\u4E0D\u5224\u65AD\u89C4\u5219\u547D\u4E2D", "dmnp-footnote"));
+    container.append(element(document2, "div", "\u62D6\u52A8\u8868\u5934\u53F3\u8FB9\u754C\u8C03\u6574\u5217\u5BBD \xB7 \u53CC\u51FB\u8FB9\u754C\u8FD8\u539F \xB7 \u70B9\u51FB\u903B\u8F91\u67E5\u770B\u5B8C\u6574\u6761\u4EF6 \xB7 \u53EA\u8BFB\u9884\u89C8\u4E0D\u5224\u65AD\u89C4\u5219\u547D\u4E2D", "dmnp-footnote"));
   }
   function importControls(container, ref) {
     const document2 = container.ownerDocument;
